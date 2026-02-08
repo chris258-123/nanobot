@@ -142,9 +142,40 @@ class LiteLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+
+            # Debug: save full request
+            import json as json_module
+            from pathlib import Path
+            from loguru import logger
+            debug_file = Path("/home/chris/Desktop/my_workspace/nanobot/tmp/nanobot_request_debug.json")
+            try:
+                # Create tmp directory if it doesn't exist
+                debug_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(debug_file, "w") as f:
+                    json_module.dump({
+                        "model": kwargs.get("model"),
+                        "messages_count": len(kwargs.get("messages", [])),
+                        "first_message": kwargs.get("messages", [{}])[0] if kwargs.get("messages") else None,
+                        "tools_count": len(tools),
+                        "first_tool": tools[0] if tools else None,
+                    }, f, indent=2, ensure_ascii=False)
+                logger.debug(f"Request debug saved to {debug_file}")
+            except Exception as e:
+                logger.warning(f"Failed to save debug info: {e}")
         
         try:
             response = await acompletion(**kwargs)
+
+            # Debug: log tool calls from response
+            from loguru import logger
+            if hasattr(response, 'choices') and len(response.choices) > 0:
+                choice = response.choices[0]
+                if hasattr(choice, 'message') and hasattr(choice.message, 'tool_calls'):
+                    if choice.message.tool_calls:
+                        logger.debug(f"Received {len(choice.message.tool_calls)} tool calls")
+                        for tc in choice.message.tool_calls:
+                            logger.debug(f"Tool: {tc.function.name}, Args: {tc.function.arguments}")
+
             return self._parse_response(response)
         except Exception as e:
             # Return error as content for graceful handling

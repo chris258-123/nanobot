@@ -161,3 +161,72 @@ class WebFetchTool(Tool):
         text = re.sub(r'</(p|div|section|article)>', '\n\n', text, flags=re.I)
         text = re.sub(r'<(br|hr)\s*/?>', '\n', text, flags=re.I)
         return _normalize(_strip_tags(text))
+
+class ZhipuWebSearchTool(Tool):
+    """Search the web using Zhipu AI Web Search API."""
+
+    name = "zhipu_web_search"
+    description = "Search the web using Zhipu AI. Returns titles, URLs, and content snippets."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query"},
+            "count": {"type": "integer", "description": "Results (1-50)", "minimum": 1, "maximum": 50},
+            "search_engine": {
+                "type": "string",
+                "enum": ["search_std", "search_pro", "search_pro_sogou", "search_pro_quark"],
+                "description": "Search engine type (default: search_pro)"
+            }
+        },
+        "required": ["query"]
+    }
+
+    def __init__(self, api_key: str | None = None, max_results: int = 5):
+        self.api_key = api_key or os.environ.get("ZHIPU_API_KEY", "")
+        self.max_results = max_results
+
+    async def execute(self, query: str, count: int | None = None,
+                     search_engine: str = "search_pro", **kwargs: Any) -> str:
+        if not self.api_key:
+            return "Error: ZHIPU_API_KEY not configured"
+
+        try:
+            # Import here to avoid dependency issues if zai-sdk not installed
+            from zai import ZhipuAiClient
+
+            n = min(max(count or self.max_results, 1), 50)
+
+            # Create client without proxy to avoid socks proxy issues
+            client = ZhipuAiClient(api_key=self.api_key)
+
+            # Call web search API
+            response = client.web_search.web_search(
+                search_engine=search_engine,
+                search_query=query,
+                count=n
+            )
+
+            if not response.search_result:
+                return f"No results for: {query}"
+
+            # Format results similar to WebSearchTool
+            lines = [f"Results for: {query}\n"]
+            for i, item in enumerate(response.search_result[:n], 1):
+                title = item.title or "No title"
+                link = item.link or "No link"
+                lines.append(f"{i}. {title}")
+                if link != "No link":
+                    lines.append(f"   {link}")
+                if item.content:
+                    # Truncate content to first 200 chars for readability
+                    content = item.content[:200] + "..." if len(item.content) > 200 else item.content
+                    lines.append(f"   {content}")
+                if item.publish_date:
+                    lines.append(f"   发布日期: {item.publish_date}")
+
+            return "\n".join(lines)
+
+        except ImportError:
+            return "Error: zai-sdk not installed. Run: pip install zai-sdk==0.2.2"
+        except Exception as e:
+            return f"Error: {e}"
