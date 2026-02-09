@@ -103,6 +103,26 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
+    # NEXUS: API proxy gateway using Anthropic's native API format
+    # Supports both Claude and GLM models, but uses Anthropic Messages API
+    # Note: NEXUS may route requests to different models (e.g., GLM) regardless of requested model name
+    ProviderSpec(
+        name="nexus",
+        keywords=("nexus",),
+        env_key="ANTHROPIC_API_KEY",        # Uses Anthropic format
+        display_name="NEXUS",
+        litellm_prefix="anthropic",         # Use Anthropic API format
+        skip_prefixes=("anthropic/",),      # Don't double-prefix
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="nexus",     # Match "nexus" in api_base URL
+        default_api_base="",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
     # === Standard providers (matched by model-name keywords) ===============
 
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
@@ -186,7 +206,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         env_key="ZAI_API_KEY",
         display_name="Zhipu AI",
         litellm_prefix="zai",              # glm-4 → zai/glm-4
-        skip_prefixes=("zhipu/", "zai/", "openrouter/", "hosted_vllm/"),
+        skip_prefixes=("zhipu/", "zai/", "openrouter/", "hosted_vllm/", "nexus/"),
         env_extras=(
             ("ZHIPUAI_API_KEY", "{api_key}"),
         ),
