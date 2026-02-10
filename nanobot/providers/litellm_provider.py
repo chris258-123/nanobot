@@ -158,6 +158,7 @@ class LiteLLMProvider(LLMProvider):
                         "first_message": kwargs.get("messages", [{}])[0] if kwargs.get("messages") else None,
                         "tools_count": len(tools),
                         "first_tool": tools[0] if tools else None,
+                        "all_tools": [t.get("function", {}).get("name") for t in tools],  # 添加所有工具名称
                     }, f, indent=2, ensure_ascii=False)
                 logger.debug(f"Request debug saved to {debug_file}")
             except Exception as e:

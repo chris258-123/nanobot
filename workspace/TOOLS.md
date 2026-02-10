@@ -63,6 +63,89 @@ web_fetch(url: str, extractMode: str = "markdown", maxChars: int = 50000) -> str
 - Supports markdown or plain text extraction
 - Output is truncated at 50,000 characters by default
 
+### zhipu_web_search
+Search using Zhipu AI web search (optimized for Chinese content).
+```
+zhipu_web_search(query: str) -> str
+```
+
+Requires `tools.web.zhipuApiKey` in config.
+
+## Browser Automation
+
+### browser
+**Control a headless browser for web automation and interaction.**
+
+**⚠️ IMPORTANT: Use this tool when the user asks to open, visit, browse, screenshot, or interact with websites!**
+
+```
+browser(
+    action: str,           # Required: open, snapshot, click, fill, type, screenshot, close, back, forward, reload, scroll
+    target: str = None,    # URL for open, element ref (@e1) or selector for click/fill, file path for screenshot
+    value: str = None,     # Text value for fill/type actions
+    session: str = None,   # Session ID for multiple isolated browser instances
+    profile: str = None    # Profile name for persistent state (cookies, localStorage)
+) -> str
+```
+
+**When to use browser vs web_fetch:**
+- Use `browser` when:
+  - User asks to "打开" (open), "访问" (visit), "浏览" (browse) a website
+  - User asks to "截图" (screenshot), "拍照" (take photo) of a page
+  - Page requires JavaScript to render
+  - Need to interact with page (click, fill forms, scroll)
+  - Need screenshots of rendered page
+  - Need to maintain session state
+- Use `web_fetch` when:
+  - Just need static HTML content
+  - Faster and lighter weight
+
+**Typical workflow:**
+```python
+# 1. Open a website
+browser(action="open", target="https://github.com")
+
+# 2. Get page structure with element references
+browser(action="snapshot")
+# Returns: heading "GitHub" [ref=e1], link "Sign in" [ref=e2], ...
+
+# 3. Interact with elements using refs
+browser(action="click", target="@e2")  # Click "Sign in" link
+
+# 4. Fill forms
+browser(action="fill", target="@e5", value="username")
+
+# 5. Take screenshot
+browser(action="screenshot", target="page.png")
+
+# 6. Close browser
+browser(action="close")
+```
+
+**Actions:**
+- `open`: Open a URL
+- `snapshot`: Get accessibility tree with element references (@e1, @e2, ...)
+- `click`: Click an element (use @e1 refs from snapshot)
+- `fill`: Fill an input field
+- `type`: Type text with keyboard
+- `screenshot`: Save screenshot to file
+- `close`: Close browser session
+- `back`, `forward`, `reload`: Navigation
+- `scroll`: Scroll the page
+
+**Notes:**
+- Requires `agent-browser` CLI to be installed: `npm install -g agent-browser && agent-browser install`
+- Element references (@e1, @e2) are easier than CSS selectors
+- Use `session` parameter for multiple isolated browser instances
+- Use `profile` parameter to persist cookies and login state across sessions
+- Browser operations are slower than web_fetch but support full JavaScript and interaction
+
+**Examples of when to use:**
+- User: "打开 GitHub" → browser(action="open", target="https://github.com")
+- User: "截图这个网页" → browser(action="screenshot", target="screenshot.png")
+- User: "访问 example.com" → browser(action="open", target="https://example.com")
+- User: "在 Google 搜索" → browser(action="open", target="https://google.com"), then snapshot, fill, click
+
 ## Communication
 
 ### message
