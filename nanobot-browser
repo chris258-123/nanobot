@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""
+Nanobot Browser Tool - 命令行工具
+直接调用浏览器进行自动化操作
+"""
+
+import asyncio
+import sys
+from pathlib import Path
+
+# 添加 nanobot 到 Python 路径
+sys.path.insert(0, str(Path.home() / 'Desktop/my_workspace/nanobot'))
+
+from nanobot.agent.tools.browser import BrowserTool
+
+
+async def cmd_open(url):
+    """打开网页"""
+    tool = BrowserTool()
+    print(f"🌐 打开 {url}...")
+    result = await tool.execute(action="open", target=url)
+    print(result)
+    print("\n💡 提示: 浏览器保持打开状态，使用其他命令继续操作")
+
+
+async def cmd_screenshot(url, filename="screenshot.png"):
+    """打开网页并截图"""
+    tool = BrowserTool()
+
+    print(f"🌐 打开 {url}...")
+    await tool.execute(action="open", target=url)
+
+    print("⏳ 等待页面加载...")
+    await asyncio.sleep(3)
+
+    print(f"📸 截图保存到 {filename}...")
+    result = await tool.execute(action="screenshot", target=filename)
+    print(result)
+
+    print("🔒 关闭浏览器...")
+    await tool.execute(action="close")
+
+    print(f"\n✅ 完成！截图已保存到: {filename}")
+
+
+async def cmd_snapshot(url):
+    """获取页面结构和元素引用"""
+    tool = BrowserTool()
+
+    print(f"🌐 打开 {url}...")
+    await tool.execute(action="open", target=url)
+
+    print("⏳ 等待页面加载...")
+    await asyncio.sleep(2)
+
+    print("📋 获取页面快照...")
+    result = await tool.execute(action="snapshot")
+    print("\n" + "="*60)
+    print(result)
+    print("="*60)
+
+    print("\n🔒 关闭浏览器...")
+    await tool.execute(action="close")
+
+
+async def cmd_search_github(keyword):
+    """在 GitHub 上搜索并截图"""
+    tool = BrowserTool()
+    url = f"https://github.com/search?q={keyword}"
+
+    print(f"🔍 在 GitHub 搜索: {keyword}")
+    await tool.execute(action="open", target=url)
+
+    print("⏳ 等待搜索结果...")
+    await asyncio.sleep(3)
+
+    filename = f"github-search-{keyword}.png"
+    print(f"📸 截图保存到 {filename}...")
+    await tool.execute(action="screenshot", target=filename)
+
+    print("📋 获取搜索结果...")
+    snapshot = await tool.execute(action="snapshot")
+    print("\n搜索结果预览:")
+    print(snapshot[:500] + "...")
+
+    print("\n🔒 关闭浏览器...")
+    await tool.execute(action="close")
+
+    print(f"\n✅ 完成！截图已保存到: {filename}")
+
+
+async def cmd_close():
+    """关闭浏览器"""
+    tool = BrowserTool()
+    print("🔒 关闭浏览器...")
+    result = await tool.execute(action="close")
+    print(result)
+
+
+def print_usage():
+    """打印使用说明"""
+    print("""
+Nanobot Browser Tool - 浏览器自动化工具
+
+用法:
+    nanobot-browser <command> [arguments]
+
+命令:
+    open <url>                  打开网页
+    screenshot <url> [file]     打开网页并截图
+    snapshot <url>              获取页面结构和元素引用
+    search-github <keyword>     在 GitHub 搜索并截图
+    close                       关闭浏览器
+
+示例:
+    nanobot-browser open https://github.com
+    nanobot-browser screenshot https://github.com github.png
+    nanobot-browser snapshot https://example.com
+    nanobot-browser search-github nanobot
+    nanobot-browser close
+
+提示:
+    - 截图默认保存为 screenshot.png
+    - 使用 snapshot 获取元素引用 (@e1, @e2, ...)
+    - 浏览器会在操作完成后自动关闭（除了 open 命令）
+""")
+
+
+async def main():
+    if len(sys.argv) < 2:
+        print_usage()
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    try:
+        if command == "open":
+            if len(sys.argv) < 3:
+                print("❌ 错误: 需要提供 URL")
+                print("用法: nanobot-browser open <url>")
+                sys.exit(1)
+            await cmd_open(sys.argv[2])
+
+        elif command == "screenshot":
+            if len(sys.argv) < 3:
+                print("❌ 错误: 需要提供 URL")
+                print("用法: nanobot-browser screenshot <url> [filename]")
+                sys.exit(1)
+            url = sys.argv[2]
+            filename = sys.argv[3] if len(sys.argv) > 3 else "screenshot.png"
+            await cmd_screenshot(url, filename)
+
+        elif command == "snapshot":
+            if len(sys.argv) < 3:
+                print("❌ 错误: 需要提供 URL")
+                print("用法: nanobot-browser snapshot <url>")
+                sys.exit(1)
+            await cmd_snapshot(sys.argv[2])
+
+        elif command == "search-github":
+            if len(sys.argv) < 3:
+                print("❌ 错误: 需要提供搜索关键词")
+                print("用法: nanobot-browser search-github <keyword>")
+                sys.exit(1)
+            await cmd_search_github(sys.argv[2])
+
+        elif command == "close":
+            await cmd_close()
+
+        elif command in ["-h", "--help", "help"]:
+            print_usage()
+
+        else:
+            print(f"❌ 未知命令: {command}")
+            print_usage()
+            sys.exit(1)
+
+    except Exception as e:
+        print(f"\n❌ 错误: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

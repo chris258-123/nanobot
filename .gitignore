@@ -18,3 +18,9 @@ __pycache__/
 poetry.lock
 .pytest_cache/
 tests/
+node_modules/
+tmp/
+storage/
+*.png
+*.jpg
+*.jpeg

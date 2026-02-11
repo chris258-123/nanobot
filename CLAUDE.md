@@ -16,6 +16,9 @@ pip install -e .
 # Install with dev dependencies
 pip install -e ".[dev]"
 
+# Install with Feishu support
+pip install -e ".[feishu]"
+
 # Initialize config and workspace
 nanobot onboard
 ```
@@ -48,6 +51,9 @@ bash core_agent_lines.sh
 ```bash
 # CLI chat (single message)
 nanobot agent -m "Your message here"
+
+# CLI chat with specific session
+nanobot agent -m "Your message" --session cli:mysession
 
 # CLI chat (interactive mode)
 nanobot agent
@@ -100,8 +106,14 @@ docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
 **Tool System** (`nanobot/agent/tools/`)
 - `registry.py`: Dynamic tool registration and execution
 - `base.py`: Base `Tool` class with JSON schema validation
-- Built-in tools: filesystem (read/write/edit/list), shell execution, web search/fetch, message sending, spawn (subagents), cron scheduling
+- Built-in tools: filesystem (read/write/edit/list), shell execution, web search/fetch, browser automation, message sending, spawn (subagents), cron scheduling
 - Tools can be restricted to workspace directory via `restrict_to_workspace` config
+
+**Browser Tool** (`nanobot/agent/tools/browser.py`)
+- Requires `agent-browser` CLI: `npm install -g agent-browser && agent-browser install`
+- Supports: open, snapshot, click, fill, type, screenshot, close, navigation, scroll
+- Uses element references (@e1, @e2) for reliable interaction
+- Session and profile support for persistent state
 
 **Provider Registry** (`nanobot/providers/registry.py`)
 - **Single source of truth** for LLM provider metadata
@@ -109,6 +121,7 @@ docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
 - Supports: OpenRouter, Anthropic, OpenAI, DeepSeek, Gemini, Zhipu, DashScope (Qwen), Moonshot (Kimi), Groq, vLLM/local
 - Auto-detects gateways by API key prefix or base URL
 - Handles model name prefixing for LiteLLM routing
+- `find_gateway()` function checks `default_api_base` to avoid misidentifying standard providers as vLLM
 
 **Message Bus** (`nanobot/bus/`)
 - Event-driven architecture with `InboundMessage` and `OutboundMessage`
@@ -119,11 +132,13 @@ docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
 - Multi-platform support: Telegram, Discord, WhatsApp (via Node.js bridge), Feishu (WebSocket)
 - Base class pattern with `ChannelAdapter` interface
 - Security: `allowFrom` whitelist for each channel
+- Groq provider enables automatic voice transcription for Telegram voice messages
 
 **Skills** (`nanobot/skills/`)
 - Markdown-based skill system (YAML frontmatter + instructions)
 - Loaded dynamically into agent context
-- Built-in skills: github, weather, summarize, tmux, cron, skill-creator, zhipu-search
+- Built-in skills: github, weather, summarize, tmux, cron, skill-creator, zhipu-search, novel-crawler
+- Skills can reference external scripts and assets
 
 **Context Builder** (`nanobot/agent/context.py`)
 - Assembles system prompt with workspace files (SOUL.md, TOOLS.md, AGENTS.md, etc.)
@@ -132,7 +147,8 @@ docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
 
 **Session Manager** (`nanobot/session/manager.py`)
 - Persistent conversation history per session
-- JSON-based storage in workspace
+- JSON-based storage in workspace: `~/.nanobot/workspace/sessions/{session_key}.json`
+- Clear session history: `rm ~/.nanobot/workspace/sessions/{session_key}.json`
 
 **Subagent Manager** (`nanobot/agent/subagent.py`)
 - Background task execution via `spawn` tool
@@ -154,7 +170,7 @@ Key sections:
 - `agents.defaults`: workspace path, model, temperature, max_tool_iterations
 - `channels`: Enable/configure Telegram, Discord, WhatsApp, Feishu
 - `tools.restrictToWorkspace`: Security sandbox (default: false)
-- `webTools.search.apiKey`: Brave Search API key (optional)
+- `tools.web.search.apiKey`: Brave Search API key (optional)
 
 ### Adding a New LLM Provider
 
@@ -169,6 +185,7 @@ ProviderSpec(
     display_name="My Provider",
     litellm_prefix="myprovider",
     skip_prefixes=("myprovider/",),
+    default_api_base="https://api.myprovider.com",  # Important: prevents vLLM misdetection
 )
 ```
 
@@ -180,6 +197,8 @@ class ProvidersConfig(BaseModel):
 ```
 
 Environment variables, model prefixing, config matching, and status display all derive automatically from the registry.
+
+**Important**: Always set `default_api_base` for standard providers to prevent `find_gateway()` from misidentifying them as vLLM local deployments.
 
 ### Adding a New Tool
 
@@ -207,6 +226,11 @@ description: Does something useful
 
 Place in `nanobot/skills/my-skill/SKILL.md`. Skills are auto-loaded by the context builder.
 
+Skills can reference external scripts:
+- Place scripts in the same directory as SKILL.md
+- Reference them in the skill documentation
+- Use relative paths or absolute paths in the workspace
+
 ## Key Design Patterns
 
 1. **Declarative Registry Pattern**: Provider metadata lives in a single registry, not scattered across if-elif chains
@@ -224,6 +248,7 @@ Place in `nanobot/skills/my-skill/SKILL.md`. Skills are auto-loaded by the conte
 - **WhatsApp requires Node.js ≥18**: Uses a TypeScript bridge in `bridge/`
 - **Feishu uses WebSocket**: No webhook or public IP needed for Feishu integration
 - **Python ≥3.11 required**: Uses modern type hints (`str | None`, etc.)
+- **Voice transcription**: Configure Groq provider to enable automatic transcription of Telegram voice messages
 
 ## Testing Philosophy
 
@@ -237,3 +262,11 @@ Place in `nanobot/skills/my-skill/SKILL.md`. Skills are auto-loaded by the conte
 - **Don't skip tool validation**: Inherit from `Tool` base class for automatic validation
 - **Don't hardcode workspace paths**: Use `get_workspace_path()` helper
 - **Don't forget to register tools**: New tools must be registered in `AgentLoop._register_default_tools()`
+- **Don't forget default_api_base**: Always set it for standard providers to prevent gateway misdetection
+- **Session history conflicts**: If switching models causes errors, clear session history with `rm ~/.nanobot/workspace/sessions/{session_key}.json`
+
+## Debugging
+
+- **Request debug logs**: Check `/tmp/nanobot_request_debug.json` or `{workspace}/tmp/nanobot_request_debug.json` for LLM request details
+- **Model resolution**: Use `python3 -c "from nanobot.config.loader import load_config; print(load_config().agents.defaults.model)"` to verify current model
+- **Gateway detection**: Use `python3 -c "from nanobot.providers.registry import find_gateway; from nanobot.config.loader import load_config; p = load_config().get_provider(); print(find_gateway(p.api_key, p.api_base))"` to check if provider is being detected as gateway

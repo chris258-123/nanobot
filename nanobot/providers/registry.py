@@ -174,7 +174,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_local=False,
         detect_by_key_prefix="",
         detect_by_base_keyword="",
-        default_api_base="",
+        default_api_base="https://api.deepseek.com",
         strip_model_prefix=False,
         model_overrides=(),
     ),
@@ -330,7 +330,13 @@ def find_gateway(api_key: str | None, api_base: str | None) -> ProviderSpec | No
             return spec
         if spec.detect_by_base_keyword and api_base and spec.detect_by_base_keyword in api_base:
             return spec
+
+    # Check if api_base matches a known standard provider before falling back to vLLM
     if api_base:
+        for spec in PROVIDERS:
+            if spec.default_api_base and api_base.startswith(spec.default_api_base):
+                return None  # Known standard provider, not a gateway
+        # Unknown api_base → treat as local (vLLM)
         return next((s for s in PROVIDERS if s.is_local), None)
     return None
 
