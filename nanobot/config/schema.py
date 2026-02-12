@@ -54,6 +54,7 @@ class AgentDefaults(BaseModel):
     max_tokens: int = 8192
     temperature: float = 0.7
     max_tool_iterations: int = 20
+    memory_window: int = 50  # Trigger consolidation after N messages
 
 
 class AgentsConfig(BaseModel):
@@ -112,6 +113,34 @@ class ToolsConfig(BaseModel):
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 
+class QdrantConfig(BaseModel):
+    """Qdrant vector database configuration."""
+    enabled: bool = False
+    url: str = "http://localhost:6333"
+    api_key: str = ""
+    collection_name: str = "novel_assets"
+
+
+class LettaConfig(BaseModel):
+    """Letta agent configuration."""
+    enabled: bool = False
+    url: str = "http://localhost:8283"
+    api_key: str = ""
+
+
+class BeadsConfig(BaseModel):
+    """Beads task management configuration."""
+    enabled: bool = False
+    workspace_path: str = "~/.beads"
+
+
+class IntegrationsConfig(BaseModel):
+    """External service integrations."""
+    qdrant: QdrantConfig = Field(default_factory=QdrantConfig)
+    letta: LettaConfig = Field(default_factory=LettaConfig)
+    beads: BeadsConfig = Field(default_factory=BeadsConfig)
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
@@ -119,6 +148,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
     
     @property
     def workspace_path(self) -> Path:

@@ -87,23 +87,119 @@ class MemoryStore:
         files = list(self.memory_dir.glob("????-??-??.md"))
         return sorted(files, reverse=True)
     
+    def get_history_file(self) -> Path:
+        """Get path to HISTORY.md file."""
+        return self.memory_dir / "HISTORY.md"
+
+    def append_to_history(self, content: str) -> None:
+        """Append event to HISTORY.md with timestamp."""
+        history_file = self.get_history_file()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"\n## {timestamp}\n{content}\n"
+
+        if history_file.exists():
+            existing = history_file.read_text(encoding="utf-8")
+            content = existing + entry
+        else:
+            content = f"# Conversation History\n{entry}"
+
+        history_file.write_text(content, encoding="utf-8")
+
+    def append_facts(self, facts: str) -> None:
+        """Append facts to MEMORY.md."""
+        if self.memory_file.exists():
+            existing = self.memory_file.read_text(encoding="utf-8")
+            content = existing + f"\n\n{facts}"
+        else:
+            content = f"# Long-term Memory\n\n{facts}"
+
+        self.memory_file.write_text(content, encoding="utf-8")
+
+    async def consolidate_session(
+        self,
+        messages: list[dict],
+        provider,
+        model: str
+    ) -> tuple[str, str]:
+        """
+        Consolidate old messages into facts and events.
+
+        Args:
+            messages: Messages to consolidate (oldest messages from session)
+            provider: LLM provider for summarization
+            model: Model to use
+
+        Returns:
+            Tuple of (facts, events) extracted from messages
+        """
+        # Build conversation text
+        conversation = "\n".join([
+            f"{m['role']}: {m['content']}"
+            for m in messages
+        ])
+
+        # Consolidation prompt
+        prompt = f"""Analyze this conversation and extract:
+1. FACTS: Important information to remember long-term (preferences, decisions, context)
+2. EVENTS: Key events that happened (actions taken, milestones)
+
+Conversation:
+{conversation}
+
+Format your response as:
+FACTS:
+- [fact 1]
+- [fact 2]
+
+EVENTS:
+- [event 1]
+- [event 2]
+
+Be concise. Only include truly important information."""
+
+        # Call LLM
+        response = await provider.chat(
+            messages=[{"role": "user", "content": prompt}],
+            model=model
+        )
+
+        # Parse response
+        content = response.content
+        facts = ""
+        events = ""
+
+        if "FACTS:" in content and "EVENTS:" in content:
+            parts = content.split("EVENTS:")
+            facts = parts[0].replace("FACTS:", "").strip()
+            events = parts[1].strip()
+
+        return facts, events
+
     def get_memory_context(self) -> str:
         """
         Get memory context for the agent.
-        
+
         Returns:
             Formatted memory context including long-term and recent memories.
         """
         parts = []
-        
+
         # Long-term memory
         long_term = self.read_long_term()
         if long_term:
             parts.append("## Long-term Memory\n" + long_term)
-        
+
+        # History (recent entries only, last 20 lines)
+        history_file = self.get_history_file()
+        if history_file.exists():
+            history = history_file.read_text(encoding="utf-8")
+            lines = history.split("\n")
+            recent_history = "\n".join(lines[-20:]) if len(lines) > 20 else history
+            parts.append("## Recent History\n" + recent_history)
+
         # Today's notes
         today = self.read_today()
         if today:
             parts.append("## Today's Notes\n" + today)
-        
+
         return "\n\n".join(parts) if parts else ""

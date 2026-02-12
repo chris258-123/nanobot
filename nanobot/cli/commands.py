@@ -212,6 +212,8 @@ def gateway(
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
+        integrations_config=config.integrations,
+        memory_window=config.agents.defaults.memory_window,
     )
     
     # Set cron callback (needs agent)
@@ -307,6 +309,8 @@ def agent(
         zhipu_api_key=config.providers.zhipu.api_key or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
+        integrations_config=config.integrations,
+        memory_window=config.agents.defaults.memory_window,
     )
     
     if message:

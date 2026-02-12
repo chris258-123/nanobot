@@ -1,5 +1,6 @@
 .assets
 .env
+llm_config.json
 *.pyc
 dist/
 build/

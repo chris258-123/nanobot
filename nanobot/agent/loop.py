@@ -19,6 +19,10 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.browser import BrowserTool
+from nanobot.agent.tools.qdrant import QdrantTool
+from nanobot.agent.tools.letta import LettaTool
+from nanobot.agent.tools.beads import BeadsTool
+from nanobot.agent.tools.novel_orchestrator import NovelOrchestratorTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 
@@ -48,8 +52,10 @@ class AgentLoop:
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
+        integrations_config: "IntegrationsConfig | None" = None,
+        memory_window: int = 50,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ExecToolConfig, IntegrationsConfig
         from nanobot.cron.service import CronService
         self.bus = bus
         self.provider = provider
@@ -61,6 +67,8 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.integrations_config = integrations_config or IntegrationsConfig()
+        self.memory_window = memory_window
         
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -113,6 +121,42 @@ class AgentLoop:
 
         # Browser tool (for web automation)
         self.tools.register(BrowserTool())
+
+        # Novel workflow tools (if enabled)
+        if self.integrations_config.qdrant.enabled:
+            qdrant_tool = QdrantTool(
+                url=self.integrations_config.qdrant.url,
+                api_key=self.integrations_config.qdrant.api_key,
+                collection_name=self.integrations_config.qdrant.collection_name
+            )
+            self.tools.register(qdrant_tool)
+
+        if self.integrations_config.letta.enabled:
+            letta_tool = LettaTool(
+                url=self.integrations_config.letta.url,
+                api_key=self.integrations_config.letta.api_key
+            )
+            self.tools.register(letta_tool)
+
+        if self.integrations_config.beads.enabled:
+            beads_tool = BeadsTool(
+                workspace_path=self.integrations_config.beads.workspace_path
+            )
+            self.tools.register(beads_tool)
+
+        # Register orchestrator if all dependencies available
+        if all([
+            self.integrations_config.qdrant.enabled,
+            self.integrations_config.letta.enabled,
+            self.integrations_config.beads.enabled
+        ]):
+            # Get registered tools
+            qdrant_tool = self.tools.get("qdrant")
+            letta_tool = self.tools.get("letta")
+            beads_tool = self.tools.get("beads")
+            if qdrant_tool and letta_tool and beads_tool:
+                orchestrator = NovelOrchestratorTool(qdrant_tool, letta_tool, beads_tool)
+                self.tools.register(orchestrator)
     
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -247,13 +291,45 @@ class AgentLoop:
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
-        
+
+        # Check if consolidation needed
+        if len(session.messages) > self.memory_window:
+            await self._consolidate_memory(session)
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content
         )
-    
+
+    async def _consolidate_memory(self, session) -> None:
+        """Consolidate old messages when session exceeds memory window."""
+        messages_to_consolidate = session.messages[:-self.memory_window]
+
+        if not messages_to_consolidate:
+            return
+
+        logger.info(f"Consolidating {len(messages_to_consolidate)} old messages")
+
+        # Extract facts and events
+        facts, events = await self.context.memory.consolidate_session(
+            messages_to_consolidate,
+            self.provider,
+            self.model
+        )
+
+        # Save to memory files
+        if facts:
+            self.context.memory.append_facts(facts)
+        if events:
+            self.context.memory.append_to_history(events)
+
+        # Trim session to keep only recent messages
+        session.messages = session.messages[-self.memory_window:]
+        self.sessions.save(session)
+
+        logger.info("Memory consolidation complete")
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).

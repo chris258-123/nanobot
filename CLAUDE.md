@@ -16,8 +16,11 @@ pip install -e .
 # Install with dev dependencies
 pip install -e ".[dev]"
 
-# Install with Feishu support
+# Install with Feishu support (adds lark-oapi dependency)
 pip install -e ".[feishu]"
+
+# Install novel workflow dependencies
+pip install -r requirements-novel.txt
 
 # Initialize config and workspace
 nanobot onboard
@@ -107,6 +110,7 @@ docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
 - `registry.py`: Dynamic tool registration and execution
 - `base.py`: Base `Tool` class with JSON schema validation
 - Built-in tools: filesystem (read/write/edit/list), shell execution, web search/fetch, browser automation, message sending, spawn (subagents), cron scheduling
+- Novel workflow tools: Qdrant (vector DB), Letta (agent memory), Beads (task management), novel orchestrator
 - Tools can be restricted to workspace directory via `restrict_to_workspace` config
 
 **Browser Tool** (`nanobot/agent/tools/browser.py`)
@@ -137,7 +141,7 @@ docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
 **Skills** (`nanobot/skills/`)
 - Markdown-based skill system (YAML frontmatter + instructions)
 - Loaded dynamically into agent context
-- Built-in skills: github, weather, summarize, tmux, cron, skill-creator, zhipu-search, novel-crawler
+- Built-in skills: github, weather, summarize, tmux, cron, skill-creator, zhipu-search, novel-crawler, novel-workflow
 - Skills can reference external scripts and assets
 
 **Context Builder** (`nanobot/agent/context.py`)
@@ -171,6 +175,7 @@ Key sections:
 - `channels`: Enable/configure Telegram, Discord, WhatsApp, Feishu
 - `tools.restrictToWorkspace`: Security sandbox (default: false)
 - `tools.web.search.apiKey`: Brave Search API key (optional)
+- `integrations`: External services (Qdrant, Letta, Beads) for novel workflow
 
 ### Adding a New LLM Provider
 
@@ -231,6 +236,105 @@ Skills can reference external scripts:
 - Reference them in the skill documentation
 - Use relative paths or absolute paths in the workspace
 
+### Novel Workflow System
+
+**Overview**
+The novel workflow system provides comprehensive support for novel writing with asset extraction, vector search, agent memory, and task management.
+
+**Components:**
+
+1. **Qdrant Tool** (`nanobot/agent/tools/qdrant.py`)
+   - Vector database for storing and retrieving novel assets
+   - Supports 8 narrative elements: plot_beat, character_card, conflict, setting, theme, pov, tone, style
+   - Chinese-optimized embeddings: m3e-base (768-dim) or BGE-large-zh-v1.5 (1024-dim)
+   - Hybrid search: vector + keyword matching
+   - Actions: create_collection, upsert, search, scroll, delete, info
+
+2. **Letta Tool** (`nanobot/agent/tools/letta.py`)
+   - Agent memory management for Writer and Archivist agents
+   - Core memory and archival memory support
+   - Actions: create_agent, send_message, update_core_memory, add_archival, search_archival, list_agents
+
+3. **Beads Tool** (`nanobot/agent/tools/beads.py`)
+   - Task management integration
+   - Supports task dependencies and status tracking
+   - Actions: add, list, update, query
+
+4. **Novel Orchestrator** (`nanobot/agent/tools/novel_orchestrator.py`)
+   - High-level workflow coordination
+   - Combines Qdrant, Letta, and Beads for complex workflows
+   - Actions: init_library, generate_chapter, extract_assets
+
+**Setup:**
+
+1. Install Beads (requires Rust/Cargo):
+```bash
+git clone https://github.com/steveyegge/beads.git
+cd beads
+cargo build --release
+sudo cp target/release/bd /usr/local/bin/
+bd --version
+```
+
+2. Start Docker services:
+```bash
+docker-compose up -d  # Qdrant (6333), Letta (8283), Postgres (5432)
+```
+
+3. Install dependencies:
+```bash
+pip install -r requirements-novel.txt
+```
+
+4. Configure in `~/.nanobot/config.json`:
+```json
+{
+  "integrations": {
+    "qdrant": {
+      "enabled": true,
+      "url": "http://localhost:6333",
+      "collection_name": "novel_assets_v2"
+    },
+    "letta": {
+      "enabled": true,
+      "url": "http://localhost:8283"
+    },
+    "beads": {
+      "enabled": true,
+      "workspace_path": "~/.beads"
+    }
+  }
+}
+```
+
+**Usage:**
+- Use the `novel-workflow` skill for guided workflows
+- Tools are auto-registered when enabled in config
+- Orchestrator requires all three tools to be enabled
+- See `skills/novel-workflow/SKILL.md` for detailed documentation
+- Novel workflow scripts use `llm_config.json` for LLM configuration (separate from main nanobot config)
+
+**LLM Config for Scripts:**
+Novel workflow scripts (asset_extractor.py, embedder.py, etc.) use a separate `llm_config.json`:
+```json
+{
+  "type": "custom",
+  "url": "https://api.deepseek.com/v1/chat/completions",
+  "model": "deepseek-chat",
+  "api_key": "sk-your-api-key"
+}
+```
+**IMPORTANT**: Never commit this file with real API keys. Add it to `.gitignore`.
+
+**Embedding Models:**
+The `embedder_parallel.py` script supports multiple embedding models:
+- `chinese`: moka-ai/m3e-base (768-dim) - uses SentenceTransformer
+- `chinese-large`: BAAI/bge-large-zh-v1.5 (1024-dim) - uses FlagModel with optimizations
+- `multilingual`: paraphrase-multilingual-MiniLM-L12-v2 (384-dim)
+- `multilingual-large`: distiluse-base-multilingual-cased-v2 (512-dim)
+
+BGE models automatically use FlagModel for better performance (query instructions, FP16 acceleration).
+
 ## Key Design Patterns
 
 1. **Declarative Registry Pattern**: Provider metadata lives in a single registry, not scattered across if-elif chains
@@ -245,10 +349,12 @@ Skills can reference external scripts:
 - **Line count matters**: This project aims to stay under 4,000 core lines. Check with `bash core_agent_lines.sh`
 - **LiteLLM integration**: All LLM calls go through LiteLLM for unified provider interface
 - **Security**: Use `restrictToWorkspace: true` in production to sandbox file/shell tools
+- **API key security**: Never commit API keys to git. The `llm_config.json` file should be added to `.gitignore`
 - **WhatsApp requires Node.js ≥18**: Uses a TypeScript bridge in `bridge/`
 - **Feishu uses WebSocket**: No webhook or public IP needed for Feishu integration
 - **Python ≥3.11 required**: Uses modern type hints (`str | None`, etc.)
 - **Voice transcription**: Configure Groq provider to enable automatic transcription of Telegram voice messages
+- **Beads requires Rust**: The Beads task management tool requires Rust/Cargo for installation
 
 ## Testing Philosophy
 
@@ -263,6 +369,7 @@ Skills can reference external scripts:
 - **Don't hardcode workspace paths**: Use `get_workspace_path()` helper
 - **Don't forget to register tools**: New tools must be registered in `AgentLoop._register_default_tools()`
 - **Don't forget default_api_base**: Always set it for standard providers to prevent gateway misdetection
+- **Don't commit API keys**: Add `llm_config.json` and any files with API keys to `.gitignore`
 - **Session history conflicts**: If switching models causes errors, clear session history with `rm ~/.nanobot/workspace/sessions/{session_key}.json`
 
 ## Debugging
