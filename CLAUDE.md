@@ -40,13 +40,13 @@ pytest --asyncio-mode=auto
 
 ### Code Quality
 ```bash
-# Run linter (Ruff)
+# Run linter (Ruff - configured for line-length=100, Python 3.11+)
 ruff check nanobot/
 
 # Format code
 ruff format nanobot/
 
-# Check line count (core agent only)
+# Check line count (core agent only - excludes channels/, cli/, providers/)
 bash core_agent_lines.sh
 ```
 
@@ -109,9 +109,15 @@ docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
 **Tool System** (`nanobot/agent/tools/`)
 - `registry.py`: Dynamic tool registration and execution
 - `base.py`: Base `Tool` class with JSON schema validation
-- Built-in tools: filesystem (read/write/edit/list), shell execution, web search/fetch, browser automation, message sending, spawn (subagents), cron scheduling
+- Built-in tools: filesystem (read/write/edit/list), shell execution, web search/fetch, browser automation, message sending, spawn (subagents), cron scheduling, supermemory (semantic memory)
 - Novel workflow tools: Qdrant (vector DB), Letta (agent memory), Beads (task management), novel orchestrator
 - Tools can be restricted to workspace directory via `restrict_to_workspace` config
+
+**Supermemory Tool** (`nanobot/agent/tools/supermemory.py`)
+- Semantic memory storage and retrieval via Supermemory API
+- Requires `SUPERMEMORY_API_KEY` environment variable
+- Actions: store (save memories with tags), search (semantic search), recall (get recent memories)
+- Optional `SUPERMEMORY_API_URL` for custom API endpoint (default: https://api.supermemory.ai/v1)
 
 **Browser Tool** (`nanobot/agent/tools/browser.py`)
 - Requires `agent-browser` CLI: `npm install -g agent-browser && agent-browser install`
@@ -141,7 +147,7 @@ docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
 **Skills** (`nanobot/skills/`)
 - Markdown-based skill system (YAML frontmatter + instructions)
 - Loaded dynamically into agent context
-- Built-in skills: github, weather, summarize, tmux, cron, skill-creator, zhipu-search, novel-crawler, novel-workflow
+- Built-in skills: github, weather, summarize, tmux, cron, skill-creator, zhipu-search, novel-crawler, novel-workflow, Auto-Redbook-Skills (Xiaohongshu/小红书 content generation)
 - Skills can reference external scripts and assets
 
 **Context Builder** (`nanobot/agent/context.py`)
@@ -348,13 +354,14 @@ BGE models automatically use FlagModel for better performance (query instruction
 
 - **Line count matters**: This project aims to stay under 4,000 core lines. Check with `bash core_agent_lines.sh`
 - **LiteLLM integration**: All LLM calls go through LiteLLM for unified provider interface
-- **Security**: Use `restrictToWorkspace: true` in production to sandbox file/shell tools
+- **Security**: Use `restrictToWorkspace: true` in production to sandbox file/shell tools. See `SECURITY.md` for comprehensive security best practices
 - **API key security**: Never commit API keys to git. The `llm_config.json` file should be added to `.gitignore`
 - **WhatsApp requires Node.js ≥18**: Uses a TypeScript bridge in `bridge/`
 - **Feishu uses WebSocket**: No webhook or public IP needed for Feishu integration
 - **Python ≥3.11 required**: Uses modern type hints (`str | None`, etc.)
 - **Voice transcription**: Configure Groq provider to enable automatic transcription of Telegram voice messages
 - **Beads requires Rust**: The Beads task management tool requires Rust/Cargo for installation
+- **Installation methods**: Available via PyPI (`pip install nanobot-ai`), uv (`uv tool install nanobot-ai`), or source (`pip install -e .`)
 
 ## Testing Philosophy
 

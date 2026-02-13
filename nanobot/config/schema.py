@@ -134,11 +134,28 @@ class BeadsConfig(BaseModel):
     workspace_path: str = "~/.beads"
 
 
+class Neo4jConfig(BaseModel):
+    """Neo4j graph database configuration."""
+    enabled: bool = False
+    uri: str = "bolt://localhost:7687"
+    username: str = "neo4j"
+    password: str = ""
+    database: str = "neo4j"
+
+
+class CanonDBConfig(BaseModel):
+    """Canon database configuration."""
+    enabled: bool = False
+    db_path: str = "~/.nanobot/workspace/canon_v2.db"
+
+
 class IntegrationsConfig(BaseModel):
     """External service integrations."""
     qdrant: QdrantConfig = Field(default_factory=QdrantConfig)
     letta: LettaConfig = Field(default_factory=LettaConfig)
     beads: BeadsConfig = Field(default_factory=BeadsConfig)
+    neo4j: Neo4jConfig = Field(default_factory=Neo4jConfig)
+    canon_db: CanonDBConfig = Field(default_factory=CanonDBConfig)
 
 
 class Config(BaseSettings):
