@@ -245,7 +245,27 @@ Skills can reference external scripts:
 ### Novel Workflow System
 
 **Overview**
-The novel workflow system provides comprehensive support for novel writing with asset extraction, vector search, agent memory, and task management.
+The novel workflow system provides comprehensive support for novel writing with a three-tier memory architecture: vector search (Qdrant), agent memory (Letta), graph database (Neo4j), and canonical entity tracking (Canon DB v2).
+
+**Three-Tier Memory System:**
+
+1. **Tier 1: Vector Memory (Qdrant)**
+   - Fast semantic search for narrative assets
+   - 8 asset types: plot_beat, character_card, conflict, setting, theme, pov, tone, style
+   - Chinese-optimized embeddings (BGE-large-zh-v1.5 or m3e-base)
+   - Hybrid search: vector + keyword matching
+
+2. **Tier 2: Graph Memory (Neo4j)**
+   - Entity relationships and temporal evolution
+   - Tracks character relationships, events, and narrative structure
+   - Supports relationship validity periods (valid_from, valid_until)
+   - Visualizable with `visualize_neo4j.py` script
+
+3. **Tier 3: Canonical Memory (Canon DB v2)**
+   - SQLite-based entity deduplication and history tracking
+   - 10-table design with event sourcing
+   - Conflict detection and resolution
+   - Commit log for all changes
 
 **Components:**
 
@@ -271,6 +291,23 @@ The novel workflow system provides comprehensive support for novel writing with 
    - Combines Qdrant, Letta, and Beads for complex workflows
    - Actions: init_library, generate_chapter, extract_assets
 
+5. **Chapter Processor** (`nanobot/skills/novel-workflow/scripts/chapter_processor.py`)
+   - Coordinates the three-tier memory system
+   - Processes chapters and extracts assets to all three memory tiers
+   - Handles entity deduplication and relationship tracking
+
+6. **Canon DB v2** (`nanobot/skills/novel-workflow/scripts/canon_db_v2.py`)
+   - SQLite-based canonical entity database
+   - 10-table design: entities, aliases, attributes, relationships, events, chapters, chunks, commits, conflicts, logs
+   - Event sourcing with full history tracking
+   - Conflict detection and resolution
+
+7. **Neo4j Manager** (`nanobot/skills/novel-workflow/scripts/neo4j_manager.py`)
+   - Graph database operations for entity relationships
+   - Manages entities (Character, Location, Item, Concept)
+   - Tracks relationships with validity periods
+   - Supports events, clues, and narrative structure
+
 **Setup:**
 
 1. Install Beads (requires Rust/Cargo):
@@ -284,7 +321,7 @@ bd --version
 
 2. Start Docker services:
 ```bash
-docker-compose up -d  # Qdrant (6333), Letta (8283), Postgres (5432)
+docker-compose up -d  # Qdrant (6333), Letta (8283), Postgres (5432), Neo4j (7474, 7687)
 ```
 
 3. Install dependencies:
@@ -308,6 +345,13 @@ pip install -r requirements-novel.txt
     "beads": {
       "enabled": true,
       "workspace_path": "~/.beads"
+    },
+    "neo4j": {
+      "enabled": true,
+      "uri": "bolt://localhost:7687",
+      "username": "neo4j",
+      "password": "novel123",
+      "database": "neo4j"
     }
   }
 }
@@ -316,9 +360,11 @@ pip install -r requirements-novel.txt
 **Usage:**
 - Use the `novel-workflow` skill for guided workflows
 - Tools are auto-registered when enabled in config
-- Orchestrator requires all three tools to be enabled
+- Orchestrator requires Qdrant, Letta, and Beads to be enabled
+- Three-tier memory system requires Qdrant, Neo4j, and Canon DB v2
 - See `skills/novel-workflow/SKILL.md` for detailed documentation
 - Novel workflow scripts use `llm_config.json` for LLM configuration (separate from main nanobot config)
+- Visualization scripts: `visualize_neo4j.py` (graph relationships), `visualize_canon_db.py` (entity statistics)
 
 **LLM Config for Scripts:**
 Novel workflow scripts (asset_extractor.py, embedder.py, etc.) use a separate `llm_config.json`:
@@ -362,6 +408,8 @@ BGE models automatically use FlagModel for better performance (query instruction
 - **Voice transcription**: Configure Groq provider to enable automatic transcription of Telegram voice messages
 - **Beads requires Rust**: The Beads task management tool requires Rust/Cargo for installation
 - **Installation methods**: Available via PyPI (`pip install nanobot-ai`), uv (`uv tool install nanobot-ai`), or source (`pip install -e .`)
+- **Three-tier memory system**: Tested with 100-chapter novels (80 characters, 2056 vector points). Requires Neo4j, Qdrant, and Canon DB v2 for full functionality
+- **Neo4j browser**: Access Neo4j browser interface at http://localhost:7474 (default credentials: neo4j/novel123)
 
 ## Testing Philosophy
 
@@ -378,6 +426,8 @@ BGE models automatically use FlagModel for better performance (query instruction
 - **Don't forget default_api_base**: Always set it for standard providers to prevent gateway misdetection
 - **Don't commit API keys**: Add `llm_config.json` and any files with API keys to `.gitignore`
 - **Session history conflicts**: If switching models causes errors, clear session history with `rm ~/.nanobot/workspace/sessions/{session_key}.json`
+- **Stable embedder IDs**: The `embedder_parallel.py` script uses UUIDv5 for stable ID generation. Don't use Python's `hash()` function for IDs as it's not stable across runs
+- **Neo4j password**: Default password is `novel123` in docker-compose.yml. Change it in production deployments
 
 ## Debugging
 

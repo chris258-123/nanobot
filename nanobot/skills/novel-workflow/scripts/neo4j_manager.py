@@ -262,6 +262,73 @@ class Neo4jManager:
 
     # ===== Query Methods =====
 
+    def get_all_entities(self, entity_type: str | None = None) -> list[dict]:
+        """Get all entity nodes."""
+        with self.driver.session(database=self.database) as session:
+            if entity_type:
+                result = session.run("""
+                    MATCH (e:Entity {type: $type})
+                    RETURN e.entity_id as entity_id, e.canonical_name as name,
+                           e.type as type, e.aliases as aliases
+                """, type=entity_type)
+            else:
+                result = session.run("""
+                    MATCH (e:Entity)
+                    RETURN e.entity_id as entity_id, e.canonical_name as name,
+                           e.type as type, e.aliases as aliases
+                """)
+            return [dict(record) for record in result]
+
+    def get_relationship_stats(self) -> dict:
+        """Get relationship statistics by type."""
+        with self.driver.session(database=self.database) as session:
+            result = session.run("""
+                MATCH ()-[r:RELATES]->()
+                RETURN r.kind as kind, count(r) as count
+                ORDER BY count DESC
+            """)
+            return {record["kind"]: record["count"] for record in result}
+
+    def get_statistics(self) -> dict:
+        """Get full graph statistics."""
+        with self.driver.session(database=self.database) as session:
+            stats = {}
+
+            result = session.run("MATCH (e:Entity) RETURN count(e) as cnt")
+            stats["entities"] = result.single()["cnt"]
+
+            result = session.run("MATCH (c:Chapter) RETURN count(c) as cnt")
+            stats["chapters"] = result.single()["cnt"]
+
+            result = session.run("MATCH (ck:Chunk) RETURN count(ck) as cnt")
+            stats["chunks"] = result.single()["cnt"]
+
+            result = session.run("MATCH (ev:Event) RETURN count(ev) as cnt")
+            stats["events"] = result.single()["cnt"]
+
+            result = session.run("MATCH ()-[r:RELATES]->() RETURN count(r) as cnt")
+            stats["relations"] = result.single()["cnt"]
+
+            result = session.run("MATCH (t:Thread) RETURN count(t) as cnt")
+            stats["threads"] = result.single()["cnt"]
+
+            # Relationship type distribution
+            stats["relation_kinds"] = self.get_relationship_stats()
+
+            # Entity type distribution
+            result = session.run("""
+                MATCH (e:Entity)
+                RETURN e.type as type, count(e) as cnt
+            """)
+            stats["entity_types"] = {r["type"]: r["cnt"] for r in result}
+
+            return stats
+
+    def clear_all(self):
+        """Clear all data from Neo4j (for re-processing)."""
+        with self.driver.session(database=self.database) as session:
+            session.run("MATCH (n) DETACH DELETE n")
+
     def get_character_state(self, entity_id: str, as_of_chapter: Optional[str] = None) -> Optional[dict]:
         """Get character state at specific chapter."""
         with self.driver.session(database=self.database) as session:

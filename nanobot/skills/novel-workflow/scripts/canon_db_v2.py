@@ -191,8 +191,13 @@ class CanonDBV2:
 
     # ===== Entity Management =====
 
-    def normalize_entity(self, name: str, entity_type: str, chapter_no: str) -> str:
-        """Normalize entity name to entity_id (alias resolution)."""
+    def normalize_entity(self, name: str, entity_type: str, chapter_no: str,
+                        aliases: list[str] | None = None) -> str:
+        """Normalize entity name to entity_id (alias resolution).
+
+        Checks canonical_name, then aliases. Creates new entity if not found.
+        If aliases provided, merges them into existing entity.
+        """
         # Check if name matches canonical name
         cursor = self.conn.execute("""
             SELECT entity_id FROM entity_registry
@@ -200,25 +205,110 @@ class CanonDBV2:
         """, (entity_type, name))
         row = cursor.fetchone()
         if row:
-            return row["entity_id"]
+            entity_id = row["entity_id"]
+            if aliases:
+                self._merge_aliases(entity_id, aliases)
+            self._update_last_seen(entity_id, chapter_no)
+            return entity_id
 
         # Check if name is in aliases
         cursor = self.conn.execute("""
             SELECT entity_id, aliases_json FROM entity_registry WHERE type = ?
         """, (entity_type,))
         for row in cursor:
-            aliases = json.loads(row["aliases_json"] or "[]")
-            if name in aliases:
-                return row["entity_id"]
+            existing_aliases = json.loads(row["aliases_json"] or "[]")
+            if name in existing_aliases:
+                entity_id = row["entity_id"]
+                if aliases:
+                    self._merge_aliases(entity_id, aliases)
+                self._update_last_seen(entity_id, chapter_no)
+                return entity_id
+
+        # Check if any provided alias matches an existing entity
+        if aliases:
+            for alias in aliases:
+                cursor = self.conn.execute("""
+                    SELECT entity_id FROM entity_registry
+                    WHERE type = ? AND (canonical_name = ? OR aliases_json LIKE ?)
+                """, (entity_type, alias, f'%"{alias}"%'))
+                row = cursor.fetchone()
+                if row:
+                    entity_id = row["entity_id"]
+                    self._merge_aliases(entity_id, [name] + aliases)
+                    self._update_last_seen(entity_id, chapter_no)
+                    return entity_id
 
         # Create new entity
         entity_id = f"{entity_type}_{uuid.uuid4().hex[:8]}"
         self.conn.execute("""
-            INSERT INTO entity_registry (entity_id, type, canonical_name, aliases_json, first_seen_chapter)
-            VALUES (?, ?, ?, ?, ?)
-        """, (entity_id, entity_type, name, json.dumps([]), chapter_no))
+            INSERT INTO entity_registry (entity_id, type, canonical_name, aliases_json, first_seen_chapter, last_seen_chapter)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (entity_id, entity_type, name, json.dumps(aliases or []), chapter_no, chapter_no))
         self.conn.commit()
         return entity_id
+
+    def _merge_aliases(self, entity_id: str, new_aliases: list[str]):
+        """Merge new aliases into existing entity."""
+        cursor = self.conn.execute("""
+            SELECT canonical_name, aliases_json FROM entity_registry WHERE entity_id = ?
+        """, (entity_id,))
+        row = cursor.fetchone()
+        if not row:
+            return
+        canonical = row["canonical_name"]
+        existing = set(json.loads(row["aliases_json"] or "[]"))
+        for alias in new_aliases:
+            if alias != canonical and alias not in existing:
+                existing.add(alias)
+        self.conn.execute("""
+            UPDATE entity_registry SET aliases_json = ? WHERE entity_id = ?
+        """, (json.dumps(list(existing)), entity_id))
+        self.conn.commit()
+
+    def _update_last_seen(self, entity_id: str, chapter_no: str):
+        """Update last_seen_chapter for entity."""
+        self.conn.execute("""
+            UPDATE entity_registry SET last_seen_chapter = ?
+            WHERE entity_id = ? AND (last_seen_chapter IS NULL OR last_seen_chapter < ?)
+        """, (chapter_no, entity_id, chapter_no))
+        self.conn.commit()
+
+    def merge_entities(self, keep_id: str, merge_id: str):
+        """Merge two entities: keep one, mark other as merged.
+
+        Moves all aliases from merge_id to keep_id, updates merged_into.
+        """
+        # Get merge entity info
+        cursor = self.conn.execute("""
+            SELECT canonical_name, aliases_json FROM entity_registry WHERE entity_id = ?
+        """, (merge_id,))
+        merge_row = cursor.fetchone()
+        if not merge_row:
+            return
+
+        # Add merge entity's name and aliases to keep entity
+        merge_aliases = [merge_row["canonical_name"]] + json.loads(merge_row["aliases_json"] or "[]")
+        self._merge_aliases(keep_id, merge_aliases)
+
+        # Mark as merged
+        self.conn.execute("""
+            UPDATE entity_registry SET merged_into = ? WHERE entity_id = ?
+        """, (keep_id, merge_id))
+
+        # Update all references in relationship_history
+        self.conn.execute("""
+            UPDATE relationship_history SET from_id = ? WHERE from_id = ?
+        """, (keep_id, merge_id))
+        self.conn.execute("""
+            UPDATE relationship_history SET to_id = ? WHERE to_id = ?
+        """, (keep_id, merge_id))
+
+        # Update all references in fact_history
+        self.conn.execute("""
+            UPDATE fact_history SET subject_id = ? WHERE subject_id = ?
+        """, (keep_id, merge_id))
+
+        self.conn.commit()
 
     def register_entity(self, entity_id: str, entity_type: str, canonical_name: str,
                        aliases: list[str], chapter_no: str):
@@ -272,7 +362,11 @@ class CanonDBV2:
     # ===== Current State Updates =====
 
     def update_current_snapshots(self, commit_id: str):
-        """Update current state tables from history."""
+        """Update current state tables from ALL fact history (not just this commit).
+
+        Aggregates the latest value for each (subject_id, predicate) pair
+        across all commits up to and including this one.
+        """
         # Get commit info
         cursor = self.conn.execute("""
             SELECT chapter_no FROM commit_log WHERE commit_id = ?
@@ -282,26 +376,39 @@ class CanonDBV2:
             return
         chapter_no = row["chapter_no"]
 
-        # Update character_current from fact_history
+        # Get all entities that have facts in this commit
         cursor = self.conn.execute("""
             SELECT DISTINCT subject_id FROM fact_history WHERE commit_id = ?
         """, (commit_id,))
-        for row in cursor:
-            entity_id = row["subject_id"]
-            # Aggregate latest facts for this entity
+        entity_ids = [row["subject_id"] for row in cursor]
+
+        for entity_id in entity_ids:
+            # Get latest value for each predicate (across ALL commits)
             facts_cursor = self.conn.execute("""
-                SELECT predicate, object_json FROM fact_history
-                WHERE subject_id = ? AND commit_id = ?
-            """, (entity_id, commit_id))
+                SELECT predicate, object_json, tier, chapter_no
+                FROM fact_history
+                WHERE subject_id = ?
+                  AND op != 'DELETE'
+                ORDER BY created_at ASC
+            """, (entity_id,))
+
             state = {}
+            status_tags = []
             for fact_row in facts_cursor:
-                state[fact_row["predicate"]] = json.loads(fact_row["object_json"])
+                pred = fact_row["predicate"]
+                val = json.loads(fact_row["object_json"])
+                state[pred] = val
+
+                # Track status tags for HARD_STATE facts
+                if fact_row["tier"] == "HARD_STATE" and pred == "status":
+                    status_tags = [val] if isinstance(val, str) else val
 
             self.conn.execute("""
                 INSERT OR REPLACE INTO character_current
-                (entity_id, state_json, updated_chapter, updated_commit)
-                VALUES (?, ?, ?, ?)
-            """, (entity_id, json.dumps(state), chapter_no, commit_id))
+                (entity_id, state_json, status_tags_json, updated_chapter, updated_commit)
+                VALUES (?, ?, ?, ?, ?)
+            """, (entity_id, json.dumps(state, ensure_ascii=False),
+                  json.dumps(status_tags, ensure_ascii=False), chapter_no, commit_id))
 
         self.conn.commit()
 
@@ -416,6 +523,36 @@ class CanonDBV2:
         if row:
             return dict(row)
         return None
+
+    def get_statistics(self) -> dict:
+        """Get database statistics for validation."""
+        stats = {}
+        for table in ["entity_registry", "character_current", "fact_history",
+                       "relationship_history", "address_book", "thread_current", "commit_log"]:
+            cursor = self.conn.execute(f"SELECT COUNT(*) as cnt FROM {table}")
+            stats[table] = cursor.fetchone()["cnt"]
+
+        # Entity type breakdown
+        cursor = self.conn.execute("""
+            SELECT type, COUNT(*) as cnt FROM entity_registry
+            WHERE merged_into IS NULL GROUP BY type
+        """)
+        stats["entity_types"] = {row["type"]: row["cnt"] for row in cursor}
+
+        # Relationship kind breakdown
+        cursor = self.conn.execute("""
+            SELECT kind, COUNT(*) as cnt FROM relationship_history GROUP BY kind
+        """)
+        stats["relation_kinds"] = {row["kind"]: row["cnt"] for row in cursor}
+
+        # Entities with aliases
+        cursor = self.conn.execute("""
+            SELECT COUNT(*) as cnt FROM entity_registry
+            WHERE aliases_json != '[]' AND aliases_json IS NOT NULL AND merged_into IS NULL
+        """)
+        stats["entities_with_aliases"] = cursor.fetchone()["cnt"]
+
+        return stats
 
     def close(self):
         """Close database connection."""
