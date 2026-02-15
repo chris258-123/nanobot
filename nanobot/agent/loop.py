@@ -22,6 +22,8 @@ from nanobot.agent.tools.browser import BrowserTool
 from nanobot.agent.tools.qdrant import QdrantTool
 from nanobot.agent.tools.letta import LettaTool
 from nanobot.agent.tools.beads import BeadsTool
+from nanobot.agent.tools.neo4j_tool import Neo4jTool
+from nanobot.agent.tools.canon_tool import CanonTool
 from nanobot.agent.tools.novel_orchestrator import NovelOrchestratorTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
@@ -144,6 +146,21 @@ class AgentLoop:
             )
             self.tools.register(beads_tool)
 
+        if self.integrations_config.neo4j.enabled:
+            neo4j_tool = Neo4jTool(
+                uri=self.integrations_config.neo4j.uri,
+                username=self.integrations_config.neo4j.username,
+                password=self.integrations_config.neo4j.password,
+                database=self.integrations_config.neo4j.database,
+            )
+            self.tools.register(neo4j_tool)
+
+        if self.integrations_config.canon_db.enabled:
+            canon_tool = CanonTool(
+                db_path=self.integrations_config.canon_db.db_path,
+            )
+            self.tools.register(canon_tool)
+
         # Register orchestrator if all dependencies available
         if all([
             self.integrations_config.qdrant.enabled,
@@ -155,7 +172,14 @@ class AgentLoop:
             letta_tool = self.tools.get("letta")
             beads_tool = self.tools.get("beads")
             if qdrant_tool and letta_tool and beads_tool:
-                orchestrator = NovelOrchestratorTool(qdrant_tool, letta_tool, beads_tool)
+                orchestrator = NovelOrchestratorTool(
+                    qdrant_tool=qdrant_tool,
+                    letta_tool=letta_tool,
+                    beads_tool=beads_tool,
+                    neo4j_tool=self.tools.get("neo4j"),
+                    canon_tool=self.tools.get("canon"),
+                    integrations_config=self.integrations_config,
+                )
                 self.tools.register(orchestrator)
     
     async def run(self) -> None:

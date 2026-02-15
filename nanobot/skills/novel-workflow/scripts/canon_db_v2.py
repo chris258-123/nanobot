@@ -3,13 +3,13 @@
 SQLite database for authoritative novel facts with event sourcing.
 """
 
-import sqlite3
 import json
+import logging
+import sqlite3
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from datetime import datetime
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -174,12 +174,22 @@ class CanonDBV2:
     def begin_commit(self, book_id: str, chapter_no: str, payload: dict) -> str:
         """Start a new commit transaction."""
         commit_id = self.generate_commit_id(book_id, chapter_no)
+        # Deterministic commit ids make chapter re-runs idempotent; clear old writes first.
+        self._purge_commit_data(commit_id)
         self.conn.execute("""
             INSERT OR REPLACE INTO commit_log (commit_id, book_id, chapter_no, commit_type, payload_json, status)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (commit_id, book_id, chapter_no, "CHAPTER_PROCESS", json.dumps(payload), "STARTED"))
         self.conn.commit()
         return commit_id
+
+    def _purge_commit_data(self, commit_id: str):
+        """Remove existing history rows for a commit before replay/re-run."""
+        self.conn.execute("DELETE FROM fact_history WHERE commit_id = ?", (commit_id,))
+        self.conn.execute("DELETE FROM relationship_history WHERE commit_id = ?", (commit_id,))
+        self.conn.execute("DELETE FROM address_book WHERE commit_id = ?", (commit_id,))
+        self.conn.execute("DELETE FROM commit_log WHERE commit_id = ?", (commit_id,))
+        self.conn.commit()
 
     def mark_commit_status(self, commit_id: str, status: str):
         """Update commit status."""
@@ -272,6 +282,30 @@ class CanonDBV2:
             WHERE entity_id = ? AND (last_seen_chapter IS NULL OR last_seen_chapter < ?)
         """, (chapter_no, entity_id, chapter_no))
         self.conn.commit()
+
+    def get_entity_by_id(self, entity_id: str) -> Optional[dict]:
+        """Fetch entity record by stable entity_id."""
+        cursor = self.conn.execute(
+            """
+            SELECT entity_id, type, canonical_name, aliases_json
+            FROM entity_registry
+            WHERE entity_id = ?
+            """,
+            (entity_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "entity_id": row["entity_id"],
+            "type": row["type"],
+            "canonical_name": row["canonical_name"],
+            "aliases": json.loads(row["aliases_json"] or "[]"),
+        }
+
+    def touch_entity(self, entity_id: str, chapter_no: str):
+        """Update entity last seen by entity_id if it already exists."""
+        self._update_last_seen(entity_id, chapter_no)
 
     def merge_entities(self, keep_id: str, merge_id: str):
         """Merge two entities: keep one, mark other as merged.
@@ -524,6 +558,113 @@ class CanonDBV2:
             return dict(row)
         return None
 
+    def get_commit_payload(self, commit_id: str) -> Optional[dict]:
+        """Get parsed commit payload and metadata."""
+        cursor = self.conn.execute("""
+            SELECT commit_id, book_id, chapter_no, status, payload_json
+            FROM commit_log WHERE commit_id = ?
+        """, (commit_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        payload = {}
+        if row["payload_json"]:
+            payload = json.loads(row["payload_json"])
+        return {
+            "commit_id": row["commit_id"],
+            "book_id": row["book_id"],
+            "chapter_no": row["chapter_no"],
+            "status": row["status"],
+            "payload": payload,
+        }
+
+    def get_last_successful_chapter(self, book_id: str) -> Optional[str]:
+        """Get the latest ALL_DONE chapter for a book."""
+        cursor = self.conn.execute("""
+            SELECT chapter_no
+            FROM commit_log
+            WHERE book_id = ? AND status = 'ALL_DONE'
+            ORDER BY chapter_no DESC
+            LIMIT 1
+        """, (book_id,))
+        row = cursor.fetchone()
+        return row["chapter_no"] if row else None
+
+    def replay_from_commit(self, book_id: str, from_chapter: str) -> list[dict]:
+        """Return successful commits from a chapter onward, in chapter order."""
+        cursor = self.conn.execute("""
+            SELECT commit_id, chapter_no, payload_json
+            FROM commit_log
+            WHERE book_id = ?
+              AND chapter_no >= ?
+              AND status = 'ALL_DONE'
+            ORDER BY chapter_no ASC
+        """, (book_id, from_chapter))
+        rows = []
+        for row in cursor:
+            rows.append({
+                "commit_id": row["commit_id"],
+                "chapter_no": row["chapter_no"],
+                "payload": json.loads(row["payload_json"] or "{}"),
+            })
+        return rows
+
+    def get_prev_context_snapshot(
+        self,
+        chapter_no: str,
+        state_limit: int = 30,
+        relation_limit: int = 30,
+        thread_limit: int = 20,
+    ) -> dict:
+        """Build a compact pre-chapter context for LLM delta extraction."""
+        context = {
+            "character_state": [],
+            "recent_relations": [],
+            "open_threads": [],
+        }
+
+        state_cursor = self.conn.execute("""
+            SELECT er.entity_id, er.canonical_name, cc.state_json, cc.updated_chapter
+            FROM character_current cc
+            JOIN entity_registry er ON er.entity_id = cc.entity_id
+            WHERE cc.updated_chapter < ?
+            ORDER BY cc.updated_chapter DESC
+            LIMIT ?
+        """, (chapter_no, state_limit))
+        for row in state_cursor:
+            context["character_state"].append({
+                "entity_id": row["entity_id"],
+                "name": row["canonical_name"],
+                "state": json.loads(row["state_json"] or "{}"),
+                "updated_chapter": row["updated_chapter"],
+            })
+
+        rel_cursor = self.conn.execute("""
+            SELECT rh.from_id, fr.canonical_name AS from_name,
+                   rh.to_id, tr.canonical_name AS to_name,
+                   rh.kind, rh.status, rh.valid_from, rh.valid_to, rh.evidence_chunk_id
+            FROM relationship_history rh
+            LEFT JOIN entity_registry fr ON fr.entity_id = rh.from_id
+            LEFT JOIN entity_registry tr ON tr.entity_id = rh.to_id
+            WHERE rh.chapter_no < ?
+            ORDER BY rh.chapter_no DESC, rh.created_at DESC
+            LIMIT ?
+        """, (chapter_no, relation_limit))
+        for row in rel_cursor:
+            context["recent_relations"].append(dict(row))
+
+        thread_cursor = self.conn.execute("""
+            SELECT thread_id, name, status, priority, planned_window, notes, updated_chapter
+            FROM thread_current
+            WHERE status != 'resolved'
+            ORDER BY priority DESC, updated_chapter DESC
+            LIMIT ?
+        """, (thread_limit,))
+        for row in thread_cursor:
+            context["open_threads"].append(dict(row))
+
+        return context
+
     def get_statistics(self) -> dict:
         """Get database statistics for validation."""
         stats = {}
@@ -591,4 +732,3 @@ if __name__ == "__main__":
     print(f"Character state: {state}")
 
     db.close()
-

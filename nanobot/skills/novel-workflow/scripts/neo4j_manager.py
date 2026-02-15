@@ -3,10 +3,11 @@
 Manages entities, relationships, events, and foreshadowing threads.
 """
 
-from neo4j import GraphDatabase
-from typing import Optional, Any
-import logging
 import json
+import logging
+from typing import Optional
+
+from neo4j import GraphDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -57,21 +58,61 @@ class Neo4jManager:
 
     # ===== Entity Layer =====
 
+    def upsert_entity(
+        self,
+        entity_id: str,
+        entity_type: str,
+        canonical_name: str,
+        aliases: list[str],
+        traits: dict,
+        status: str,
+        commit_id: str,
+    ) -> None:
+        """Create/update a generic entity node with type-specific label."""
+        label_map = {
+            "character": "Character",
+            "location": "Location",
+            "item": "Item",
+            "concept": "Concept",
+            "organization": "Organization",
+            "rule": "Rule",
+        }
+        safe_type = (entity_type or "character").lower()
+        label = label_map.get(safe_type, "Entity")
+        query = f"""
+            MERGE (e:Entity:{label} {{entity_id: $entity_id}})
+            SET e.canonical_name = $canonical_name,
+                e.aliases = $aliases,
+                e.traits_json = $traits_json,
+                e.status = $status,
+                e.type = $entity_type,
+                e.updated_commit = $commit_id,
+                e.updated_at = datetime()
+        """
+        with self.driver.session(database=self.database) as session:
+            session.run(
+                query,
+                entity_id=entity_id,
+                canonical_name=canonical_name,
+                aliases=aliases,
+                traits_json=json.dumps(traits),
+                status=status,
+                entity_type=safe_type,
+                commit_id=commit_id,
+            )
+
     def upsert_character(self, entity_id: str, canonical_name: str, aliases: list[str],
                         traits: dict, status: str, commit_id: str) -> None:
         """Create or update character entity."""
-        with self.driver.session(database=self.database) as session:
-            session.run("""
-                MERGE (e:Entity:Character {entity_id: $entity_id})
-                SET e.canonical_name = $canonical_name,
-                    e.aliases = $aliases,
-                    e.traits_json = $traits_json,
-                    e.status = $status,
-                    e.type = 'character',
-                    e.updated_commit = $commit_id,
-                    e.updated_at = datetime()
-            """, entity_id=entity_id, canonical_name=canonical_name, aliases=aliases,
-                traits_json=json.dumps(traits), status=status, commit_id=commit_id)
+        self.upsert_entity(
+            entity_id=entity_id,
+            entity_type="character",
+            canonical_name=canonical_name,
+            aliases=aliases,
+            traits=traits,
+            status=status,
+            commit_id=commit_id,
+        )
 
     def upsert_location(self, entity_id: str, name: str, level: str,
                        parent_id: Optional[str], description: str, commit_id: str) -> None:
@@ -138,13 +179,13 @@ class Neo4jManager:
             for chunk in chunks:
                 session.run("""
                     MATCH (c:Chapter {chapter_no: $chapter_no})
-                    CREATE (ck:Chunk {
+                    MERGE (ck:Chunk {
                         chunk_id: $chunk_id,
                         text: $text,
                         start_pos: $start_pos,
                         end_pos: $end_pos
                     })
-                    CREATE (c)-[:HAS_CHUNK]->(ck)
+                    MERGE (c)-[:HAS_CHUNK]->(ck)
                 """, chapter_no=chapter_no, chunk_id=chunk["chunk_id"],
                     text=chunk["text"], start_pos=chunk["start_pos"],
                     end_pos=chunk["end_pos"])
@@ -168,15 +209,15 @@ class Neo4jManager:
             session.run("""
                 MATCH (a:Entity {entity_id: $from_id})
                 MATCH (b:Entity {entity_id: $to_id})
-                CREATE (a)-[r:RELATES {
+                MERGE (a)-[r:RELATES {
                     kind: $kind,
-                    status: $status,
                     valid_from: $valid_from,
-                    valid_to: $valid_to,
-                    evidence_chunk_id: $evidence_chunk_id,
-                    commit_id: $commit_id,
-                    created_at: datetime()
+                    commit_id: $commit_id
                 }]->(b)
+                SET r.status = $status,
+                    r.valid_to = $valid_to,
+                    r.evidence_chunk_id = $evidence_chunk_id,
+                    r.created_at = datetime()
             """, from_id=from_id, to_id=to_id, kind=kind, status=status,
                 valid_from=valid_from, valid_to=valid_to,
                 evidence_chunk_id=evidence_chunk_id, commit_id=commit_id)
@@ -190,13 +231,11 @@ class Neo4jManager:
         with self.driver.session(database=self.database) as session:
             # Create event
             session.run("""
-                CREATE (ev:Event {
-                    event_id: $event_id,
-                    type: $event_type,
-                    summary: $summary,
-                    commit_id: $commit_id,
-                    created_at: datetime()
-                })
+                MERGE (ev:Event {event_id: $event_id})
+                SET ev.type = $event_type,
+                    ev.summary = $summary,
+                    ev.commit_id = $commit_id,
+                    ev.created_at = datetime()
             """, event_id=event_id, event_type=event_type, summary=summary,
                 commit_id=commit_id)
 
@@ -204,7 +243,7 @@ class Neo4jManager:
             session.run("""
                 MATCH (ev:Event {event_id: $event_id})
                 MATCH (c:Chapter {chapter_no: $chapter_no})
-                CREATE (ev)-[:OCCURS_IN]->(c)
+                MERGE (ev)-[:OCCURS_IN]->(c)
             """, event_id=event_id, chapter_no=chapter_no)
 
             # Link participants
@@ -212,7 +251,7 @@ class Neo4jManager:
                 session.run("""
                     MATCH (ev:Event {event_id: $event_id})
                     MATCH (p:Character {entity_id: $participant_id})
-                    CREATE (p)-[:PARTICIPATES_IN]->(ev)
+                    MERGE (p)-[:PARTICIPATES_IN]->(ev)
                 """, event_id=event_id, participant_id=participant_id)
 
             # Link location
@@ -220,7 +259,7 @@ class Neo4jManager:
                 session.run("""
                     MATCH (ev:Event {event_id: $event_id})
                     MATCH (loc:Location {entity_id: $location_id})
-                    CREATE (ev)-[:HAPPENS_AT]->(loc)
+                    MERGE (ev)-[:HAPPENS_AT]->(loc)
                 """, event_id=event_id, location_id=location_id)
 
     # ===== Thread Layer =====
@@ -396,4 +435,3 @@ if __name__ == "__main__":
     print(f"Character state: {state}")
 
     manager.close()
-

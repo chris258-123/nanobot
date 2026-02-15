@@ -1,19 +1,120 @@
 ---
 name: novel-workflow
-description: Novel writing workflow with 8-element asset extraction, vector search (BGE-large/m3e-base), and hybrid retrieval.
+description: Run novel pipelines for 8-element assets, embedding/hybrid retrieval, and the current three-tier memory commit workflow (LLM delta -> Canon -> Neo4j -> replay).
+metadata: {"nanobot":{"emoji":"📚","os":["darwin","linux"],"requires":{"bins":["python3"]}}}
 ---
 
 # Novel Workflow Skill
 
-Extract narrative assets from novels, embed them with Chinese-optimized models, and search with hybrid vector+keyword matching.
+Use this skill for two related paths:
+- Asset/Retrieval path: extraction -> embedding -> hybrid search
+- Memory path (current main): LLM delta -> Canon -> Neo4j -> replay -> visualization
 
-## Quick Start
+Prefer the memory path for long-running chapter consistency work.
+
+## One-click generation (user specifies world + chapter count)
+
+This path does not require per-chapter manual outline. You provide world settings once, then generate N chapters in one run.
 
 ```bash
-# 1. Start services
-docker-compose up -d  # Qdrant (6333), Letta (8283), Postgres (5432)
+python nanobot/skills/novel-workflow/scripts/generate_book_one_click.py \
+  --book-id novel_new_01 \
+  --world-config nanobot/skills/novel-workflow/templates/world_spec.example.json \
+  --chapter-count 20 \
+  --start-chapter 1 \
+  --output-dir /tmp/novel_new_01 \
+  --llm-config /tmp/llm_config_claude.json
+```
 
-# 2. Extract assets (parallel, 8 narrative elements)
+Optional memory commit while generating:
+
+```bash
+python nanobot/skills/novel-workflow/scripts/generate_book_one_click.py \
+  --book-id novel_new_01 \
+  --world-config nanobot/skills/novel-workflow/templates/world_spec.example.json \
+  --chapter-count 20 \
+  --output-dir /tmp/novel_new_01 \
+  --llm-config /tmp/llm_config_claude.json \
+  --commit-memory \
+  --canon-db-path ~/.nanobot/workspace/canon_v2_reprocessed.db
+```
+
+World-setting template:
+- `nanobot/skills/novel-workflow/templates/world_spec.example.json`
+
+Outputs:
+- `<output_dir>/<book_id>_blueprint.json`
+- `<output_dir>/<book_id>_chapter_0001.md` ... chapter files
+- `<output_dir>/<book_id>_run_report.json`
+
+## Quickstart (memory path, default settings)
+
+```bash
+python nanobot/skills/novel-workflow/scripts/reprocess_all.py \
+  --mode llm \
+  --book-id novel_04_llm_assets_full \
+  --asset-dir /home/chris/novel_assets_enhanced \
+  --from-chapter 0001 \
+  --llm-config /home/chris/Desktop/my_workspace/nanobot/llm_config.json \
+  --canon-db-path /tmp/canon_v2_llm_assets_full.db \
+  --reset-canon --reset-neo4j
+```
+
+After start, you should see a live progress bar:
+
+```text
+[=====-------------------------] 120/985  12.2% elapsed=00:48:12 eta=05:46:03 last=0120 status=ok
+```
+
+## Resume safely (no reset)
+
+When interrupted, continue from the next chapter and reuse the same Canon DB file:
+
+```bash
+python nanobot/skills/novel-workflow/scripts/reprocess_all.py \
+  --mode llm \
+  --book-id novel_04_llm_assets_full \
+  --asset-dir /home/chris/novel_assets_enhanced \
+  --from-chapter 0121 \
+  --llm-config /home/chris/Desktop/my_workspace/nanobot/llm_config.json \
+  --canon-db-path /tmp/canon_v2_llm_assets_full.db
+```
+
+Do not pass `--reset-canon` or `--reset-neo4j` when resuming.
+
+## Modes
+
+`reprocess_all.py` supports:
+- `--mode llm`: chapter assets/text -> LLM delta -> Canon/Neo4j commit
+- `--mode delta`: deterministic assets -> delta (no LLM extraction)
+- `--mode replay`: replay commit payloads without LLM
+
+## Visualize current progress
+
+```bash
+python nanobot/skills/novel-workflow/scripts/visualize_canon_db.py \
+  --db-path /tmp/canon_v2_llm_assets_full.db
+```
+
+```bash
+python nanobot/skills/novel-workflow/scripts/visualize_neo4j.py \
+  --uri bolt://localhost:7687 \
+  --username neo4j \
+  --password novel123 \
+  --protagonist-name 罗彬瀚
+```
+
+Generated files (cwd):
+- Canon: `canon_entity_distribution.png`, `canon_fact_timeline.png`, `canon_relationship_changes.png`, `canon_commit_status.png`, `canon_top_characters.png`, `canon_summary.txt`
+- Neo4j: `neo4j_character_network.png`, `neo4j_character_network_no_protagonist.png`, `neo4j_events_timeline.png`
+
+## Asset/Retrieval quickstart (legacy path, still valid)
+
+```bash
+# 1) Start services
+docker compose up -d
+
+# 2) Extract 8-element assets
 python nanobot/skills/novel-workflow/scripts/asset_extractor_parallel.py \
   --book-id novel_01 \
   --chapter-dir ~/novel_data/novel_01 \
@@ -21,197 +122,78 @@ python nanobot/skills/novel-workflow/scripts/asset_extractor_parallel.py \
   --llm-config llm_config.json \
   --workers 8
 
-# 3. Embed with BGE-large (recommended)
+# 3) Embedding
 python nanobot/skills/novel-workflow/scripts/embedder_parallel.py \
   --assets-dir ~/novel_assets_enhanced \
   --book-id novel_01 \
   --model chinese-large \
   --workers 5
 
-# 4. Search
+# 4) Hybrid search
 python test_hybrid_search_bge.py
 ```
 
-## Prerequisites
+## Embedding model options
 
 ```bash
-# Install dependencies
-pip install -r requirements-novel.txt
-
-# Required packages
-# - qdrant-client>=1.7.0
-# - sentence-transformers>=2.2.0
-# - FlagEmbedding>=1.3.0
-# - httpx>=0.25.0
+--model chinese-large  # BAAI/bge-large-zh-v1.5
+--model chinese        # moka-ai/m3e-base
+--model multilingual   # paraphrase-multilingual-MiniLM-L12-v2
 ```
 
-## Configuration
+## LLM config formats
 
-`~/.nanobot/config.json`:
+### custom
+
 ```json
 {
-  "integrations": {
-    "qdrant": {
-      "enabled": true,
-      "url": "http://localhost:6333",
-      "collection_name": "novel_assets_v2"
-    },
-    "letta": {
-      "enabled": true,
-      "url": "http://localhost:8283"
-    },
-    "beads": {
-      "enabled": true,
-      "workspace_path": "~/.beads"
-    }
-  }
+  "type": "custom",
+  "url": "https://your-endpoint/v1/chat/completions",
+  "model": "claude-sonnet-4-5",
+  "api_key": "YOUR_API_KEY",
+  "max_tokens": 4096
 }
 ```
 
-## Embedding Models
+### providers
 
-```bash
-# BGE-large (best quality, 1024-dim)
---model chinese-large  # BAAI/bge-large-zh-v1.5
-
-# m3e-base (good balance, 768-dim)
---model chinese  # moka-ai/m3e-base
-
-# Multilingual (384-dim)
---model multilingual  # paraphrase-multilingual-MiniLM-L12-v2
-```
-
-BGE-large uses optimized FlagModel loading automatically.
-
-## Asset Types (8 Elements)
-
-Extracted per chapter:
-- `plot_beat`: Events, causality, character involvement
-- `character_card`: Traits, state, relationships, goals
-- `conflict`: 6 types (人vs人/环境/社会/自我/命运/超自然)
-- `setting`: Location, time, atmosphere, world rules
-- `theme`: Themes, manifestations, symbolism
-- `point_of_view`: Person, knowledge level, focalization
-- `tone`: Emotional arc, mood, tension
-- `style`: Sentence structure, vocabulary, rhetoric
-
-## Search Examples
-
-### Python API
-
-```python
-from sentence_transformers import SentenceTransformer
-import httpx
-
-# Load model
-model = SentenceTransformer('BAAI/bge-large-zh-v1.5')
-query_vector = model.encode("冷静的角色").tolist()
-
-# Vector search
-response = httpx.post(
-    "http://localhost:6333/collections/novel_assets_v2/points/search",
-    json={
-        "vector": query_vector,
-        "limit": 5,
-        "with_payload": True,
-        "filter": {
-            "must": [{"key": "asset_type", "match": {"value": "character_card"}}]
-        }
+```json
+{
+  "providers": {
+    "anthropic": {
+      "apiKey": "YOUR_API_KEY",
+      "apiBase": "https://your-proxy-base",
+      "extraHeaders": null
     }
-)
-
-results = response.json()["result"]
+  },
+  "model": "claude-sonnet-4-5",
+  "max_tokens": 4096
+}
 ```
 
-### Hybrid Search
+## Script map
 
-```python
-# Use test script
-python test_hybrid_search_bge.py
-
-# Or use HybridSearcherBGE class
-from test_hybrid_search_bge import HybridSearcherBGE
-
-searcher = HybridSearcherBGE()
-results = searcher.hybrid_search("冷静的，飞船", limit=10)
-
-for r in results:
-    print(f"Score: {r['score']:.4f}")
-    print(f"Text: {r['payload']['text'][:100]}...")
-```
-
-## Tools Available
-
-Use via nanobot agent:
-
-```python
-# Qdrant operations
-qdrant(action="search", query="冷静的角色", asset_type="character_card", limit=5)
-qdrant(action="scroll", book_id="novel_01", asset_type="plot_beat", limit=20)
-qdrant(action="info")
-
-# Letta agent memory
-letta(action="create_agent", agent_type="writer")
-letta(action="send_message", agent_id="writer_id", message="Generate chapter 1")
-
-# Beads task management
-beads(action="add", title="Extract chapter 1-10", description="Batch extraction")
-beads(action="list", doable=True)
-
-# Novel orchestrator (requires all 3 tools enabled)
-novel_orchestrator(action="init_library", book_id="novel_01")
-```
-
-## Performance
-
-| Metric | Value |
-|--------|-------|
-| Extraction speed | ~5 chapters/min (8 workers) |
-| Embedding speed | ~2.5 files/sec (5 workers) |
-| Search latency | <150ms |
-| Assets per chapter | ~23 |
-
-## Upgrade Existing Collection
-
-```bash
-# Delete old collection
-curl -X DELETE http://localhost:6333/collections/novel_assets_v2
-
-# Re-embed with BGE-large
-python nanobot/skills/novel-workflow/scripts/embedder_parallel.py \
-  --assets-dir ~/novel_assets_enhanced \
-  --book-id novel_01 \
-  --model chinese-large \
-  --workers 5
-```
+- `scripts/reprocess_all.py`: batch runner (`llm`, `delta`, `replay`) + timed progress bar
+- `scripts/generate_book_one_click.py`: world-setting + chapter-count one-click generator
+- `scripts/chapter_processor.py`: chapter commit orchestration (Canon + Neo4j + Qdrant hook)
+- `scripts/delta_extractor_llm.py`: LLM delta extraction
+- `scripts/canon_db_v2.py`: authoritative commit/fact/relationship store
+- `scripts/neo4j_manager.py`: graph schema and writes
+- `scripts/visualize_canon_db.py`: Canon reports/charts
+- `scripts/visualize_neo4j.py`: Neo4j network/timeline charts
+- `scripts/asset_extractor_parallel.py`: 8-element extraction
+- `scripts/embedder_parallel.py`: embeddings
+- `scripts/hybrid_search.py`: hybrid retrieval
 
 ## Troubleshooting
 
-```bash
-# Check Qdrant
-curl http://localhost:6333/collections/novel_assets_v2
+- `Connection refused localhost:7687`: run `docker compose up -d neo4j`
+- Progress reset unexpectedly: check whether reset flags were used
+- JSON parse failures in LLM mode: keep `max_tokens` sufficiently high
+- If interrupted: resume with `--from-chapter` and existing Canon DB
 
-# Check Letta
-curl http://localhost:8283/v1/agents
+## Safety
 
-# Pre-download model
-python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-large-zh-v1.5')"
-
-# Restart services
-docker-compose restart
-```
-
-## Scripts
-
-- `asset_extractor_parallel.py`: Parallel extraction (8 elements)
-- `embedder_parallel.py`: Parallel embedding (multi-model support)
-- `hybrid_search.py`: Hybrid search library
-- `test_hybrid_search_bge.py`: Search test script
-- `context_pack.py`: Assemble context for generation
-- `canon_db.py`: Character state tracking
-
----
-
-**Version**: 2.1 (BGE-large Support)
-**Last Updated**: 2026-02-12
-**Test Dataset**: novel_04 (985 chapters, 20636 assets)
+- Never commit API keys or runtime DB files
+- Keep secrets in local config/env
+- Redact credentials before sharing logs
