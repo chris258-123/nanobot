@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+import httpx
 from canon_db_v2 import CanonDBV2
 from delta_converter import convert_assets_to_delta, load_and_convert
 from delta_extractor_llm import DeltaExtractorLLM
@@ -58,6 +61,8 @@ class ChapterProcessor:
         neo4j_pass: str,
         canon_db_path: str,
         qdrant_url: Optional[str] = None,
+        qdrant_collection: str = "novel_assets_v2",
+        qdrant_api_key: str = "",
         llm_config: Optional[dict[str, Any]] = None,
         llm_max_tokens: int = 4096,
         context_state_limit: int = 30,
@@ -66,7 +71,10 @@ class ChapterProcessor:
     ):
         self.neo4j = Neo4jManager(neo4j_uri, neo4j_user, neo4j_pass)
         self.canon_db = CanonDBV2(canon_db_path)
-        self.qdrant_url = qdrant_url
+        self.qdrant_url = (qdrant_url or "").rstrip("/")
+        self.qdrant_collection = qdrant_collection
+        self.qdrant_api_key = qdrant_api_key
+        self._qdrant_vector_schema: dict[str, Any] | None = None
         self.llm_config = llm_config
         self.llm_max_tokens = llm_max_tokens
         self.context_state_limit = context_state_limit
@@ -630,17 +638,144 @@ class ChapterProcessor:
             raise ValueError("llm_config is required for asset extraction")
         return extract_all_assets(chapter_text, self.llm_config)
 
-    def _write_qdrant(self, chapter_no: str, commit_id: str, assets: dict[str, Any], delta: dict[str, Any]):
-        """Placeholder for Qdrant writes; keeps commit state flow stable."""
+    def _qdrant_headers(self) -> dict[str, str]:
+        return {"api-key": self.qdrant_api_key} if self.qdrant_api_key else {}
+
+    def _load_qdrant_vector_schema(self) -> dict[str, Any]:
+        if self._qdrant_vector_schema is not None:
+            return self._qdrant_vector_schema
+        response = httpx.get(
+            f"{self.qdrant_url}/collections/{self.qdrant_collection}",
+            headers=self._qdrant_headers(),
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        vectors = response.json().get("result", {}).get("config", {}).get("params", {}).get("vectors")
+        if not vectors:
+            vectors = {"size": 384}
+        self._qdrant_vector_schema = vectors
+        return vectors
+
+    def _build_qdrant_vector_payload(self) -> list[float] | dict[str, list[float]]:
+        vectors = self._load_qdrant_vector_schema()
+        if isinstance(vectors, dict) and "size" in vectors:
+            return [0.0] * int(vectors["size"])
+        if isinstance(vectors, dict):
+            payload: dict[str, list[float]] = {}
+            for name, spec in vectors.items():
+                size = int(spec.get("size", 384)) if isinstance(spec, dict) else 384
+                payload[name] = [0.0] * size
+            return payload
+        return [0.0] * 384
+
+    def _stable_point_id(self, *parts: str) -> int:
+        digest = hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()
+        return int(digest[:16], 16)
+
+    def _upsert_qdrant_points(self, points: list[dict[str, Any]]) -> None:
+        response = httpx.put(
+            f"{self.qdrant_url}/collections/{self.qdrant_collection}/points",
+            headers=self._qdrant_headers(),
+            json={"points": points},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+
+    def _write_qdrant(
+        self,
+        book_id: str,
+        chapter_no: str,
+        commit_id: str,
+        chapter_summary: str,
+        assets: dict[str, Any],
+        delta: dict[str, Any],
+    ):
+        """Write chapter/fact/relation digest points into Qdrant for recall + hard-fact supplements."""
         if not self.qdrant_url:
             return
-        fact_digest_count = len(delta.get("fact_changes", [])) + len(delta.get("relations_delta", []))
+
+        vector_payload = self._build_qdrant_vector_payload()
+        points: list[dict[str, Any]] = []
+
+        digest_text = chapter_summary or (delta.get("events", [{}])[0].get("summary", "") if delta.get("events") else "")
+        if digest_text:
+            points.append(
+                {
+                    "id": self._stable_point_id(book_id, chapter_no, "chapter_digest"),
+                    "vector": vector_payload,
+                    "payload": {
+                        "book_id": book_id,
+                        "chapter": chapter_no,
+                        "commit_id": commit_id,
+                        "asset_type": "chapter_digest",
+                        "memory_type": "chapter_digest",
+                        "text": digest_text,
+                        "metadata": {"source": "chapter_processor"},
+                    },
+                }
+            )
+
+        for idx, fact in enumerate(delta.get("fact_changes", []), 1):
+            value = json.dumps(fact.get("value"), ensure_ascii=False)
+            fact_text = (
+                f"{fact.get('subject_name') or fact.get('subject_id')} "
+                f"{fact.get('predicate')} -> {value} "
+                f"({fact.get('tier')}/{fact.get('status')})"
+            )
+            points.append(
+                {
+                    "id": self._stable_point_id(book_id, chapter_no, "fact_digest", str(idx)),
+                    "vector": vector_payload,
+                    "payload": {
+                        "book_id": book_id,
+                        "chapter": chapter_no,
+                        "commit_id": commit_id,
+                        "asset_type": "fact_digest",
+                        "memory_type": "fact_digest",
+                        "text": fact_text,
+                        "metadata": {
+                            "evidence_chunk_id": fact.get("evidence_chunk_id"),
+                            "subject_id": fact.get("subject_id"),
+                        },
+                    },
+                }
+            )
+
+        for idx, rel in enumerate(delta.get("relations_delta", []), 1):
+            rel_text = (
+                f"{rel.get('from_name') or rel.get('from_id')} -{rel.get('kind')}/"
+                f"{rel.get('status')}-> {rel.get('to_name') or rel.get('to_id')}"
+            )
+            points.append(
+                {
+                    "id": self._stable_point_id(book_id, chapter_no, "relation_digest", str(idx)),
+                    "vector": vector_payload,
+                    "payload": {
+                        "book_id": book_id,
+                        "chapter": chapter_no,
+                        "commit_id": commit_id,
+                        "asset_type": "relation_digest",
+                        "memory_type": "relation_digest",
+                        "text": rel_text,
+                        "metadata": {
+                            "evidence_chunk_id": rel.get("evidence_chunk_id"),
+                            "from_id": rel.get("from_id"),
+                            "to_id": rel.get("to_id"),
+                            "kind": rel.get("kind"),
+                        },
+                    },
+                }
+            )
+
+        if not points:
+            return
+        self._upsert_qdrant_points(points)
         logger.info(
-            "[%s] Qdrant write placeholder (commit=%s assets=%d fact_digests=%d)",
+            "[%s] Qdrant wrote %d points (commit=%s collection=%s)",
             chapter_no,
+            len(points),
             commit_id[:8],
-            len(assets or {}),
-            fact_digest_count,
+            self.qdrant_collection,
         )
 
     def _apply_to_neo4j(
@@ -848,7 +983,14 @@ class ChapterProcessor:
             results["events"] = neo4j_stats["events"]
             self.canon_db.mark_commit_status(commit_id, "NEO4J_DONE")
 
-            self._write_qdrant(chapter_no, commit_id, assets or {}, resolved_delta)
+            self._write_qdrant(
+                book_id=book_id,
+                chapter_no=chapter_no,
+                commit_id=commit_id,
+                chapter_summary=chapter_summary,
+                assets=assets or {},
+                delta=resolved_delta,
+            )
             self.canon_db.mark_commit_status(commit_id, "ALL_DONE")
         except Exception as exc:
             logger.exception("[%s] chapter processing failed", chapter_no)
@@ -928,7 +1070,14 @@ class ChapterProcessor:
             commit_id=commit_id,
         )
         self.canon_db.mark_commit_status(commit_id, "NEO4J_DONE")
-        self._write_qdrant(chapter_no, commit_id, assets, normalized_delta)
+        self._write_qdrant(
+            book_id=book_id,
+            chapter_no=chapter_no,
+            commit_id=commit_id,
+            chapter_summary="",
+            assets=assets,
+            delta=normalized_delta,
+        )
         self.canon_db.mark_commit_status(commit_id, "ALL_DONE")
         return {"status": "success", "commit_id": commit_id, "chapter_no": chapter_no}
 

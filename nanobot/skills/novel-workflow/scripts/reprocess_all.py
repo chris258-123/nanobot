@@ -117,6 +117,9 @@ def main():
     parser.add_argument("--neo4j-uri", default="bolt://localhost:7687")
     parser.add_argument("--neo4j-user", default="neo4j")
     parser.add_argument("--neo4j-pass", default="novel123")
+    parser.add_argument("--qdrant-url", default="")
+    parser.add_argument("--qdrant-collection", default="novel_assets_v2")
+    parser.add_argument("--qdrant-api-key", default="")
     parser.add_argument("--reset-neo4j", action="store_true")
     parser.add_argument("--reset-canon", action="store_true")
     parser.add_argument("--llm-max-retries", type=int, default=3)
@@ -159,6 +162,9 @@ def main():
         neo4j_user=args.neo4j_user,
         neo4j_pass=args.neo4j_pass,
         canon_db_path=args.canon_db_path,
+        qdrant_url=args.qdrant_url or None,
+        qdrant_collection=args.qdrant_collection,
+        qdrant_api_key=args.qdrant_api_key,
         llm_config=_load_llm_config(args.llm_config),
         llm_max_tokens=args.llm_max_tokens,
         context_state_limit=args.context_state_limit,

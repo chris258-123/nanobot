@@ -52,7 +52,7 @@ class NovelOrchestratorTool(Tool):
 Actions:
 - init_library: initialize library for a book (requires: book_id)
 - generate_chapter: generate chapter via letta writer (requires: template_book_id, new_book_id, chapter_num)
-- generate_book: one-click generate chapters from world settings (requires: book_id, chapter_count, world/world_config)
+- generate_book: one-click generation (supports A-read/B-write isolation) from world settings
 - extract_assets: placeholder orchestration for extraction task tracking (requires: book_id, chapter_path)
 - process_chapter: run ChapterProcessor for one chapter (requires: book_id, chapter_no; optional: chapter_text/chapter_path/asset_path/mode)
 - assemble_context: build Context Pack v2 (requires: book_id, chapter_no)
@@ -81,6 +81,7 @@ Actions:
                 "new_book_id": {"type": "string"},
                 "chapter_num": {"type": "integer"},
                 "chapter_count": {"type": "integer"},
+                "target_book_id": {"type": "string"},
                 "chapter_no": {"type": "string"},
                 "chapter_path": {"type": "string"},
                 "chapter_text": {"type": "string"},
@@ -89,6 +90,13 @@ Actions:
                 "world": {"type": "string"},
                 "world_config": {"type": "string"},
                 "output_dir": {"type": "string"},
+                "reference_top_k": {"type": "integer", "default": 8},
+                "consistency_policy": {
+                    "type": "string",
+                    "enum": ["strict_blocking", "warn_only"],
+                    "default": "strict_blocking",
+                },
+                "enforce_isolation": {"type": "boolean", "default": True},
                 "start_chapter": {"type": "integer"},
                 "resume": {"type": "boolean"},
                 "commit_memory": {"type": "boolean"},
@@ -106,6 +114,22 @@ Actions:
                 "output_path": {"type": "string"},
                 "proposed_facts": {"type": "array", "items": {"type": "object"}},
                 "proposed_relations": {"type": "array", "items": {"type": "object"}},
+                "target_canon_db_path": {"type": "string"},
+                "target_neo4j_uri": {"type": "string"},
+                "target_neo4j_user": {"type": "string"},
+                "target_neo4j_pass": {"type": "string"},
+                "target_neo4j_database": {"type": "string"},
+                "target_qdrant_url": {"type": "string"},
+                "target_qdrant_collection": {"type": "string"},
+                "target_qdrant_api_key": {"type": "string"},
+                "template_canon_db_path": {"type": "string"},
+                "template_neo4j_uri": {"type": "string"},
+                "template_neo4j_user": {"type": "string"},
+                "template_neo4j_pass": {"type": "string"},
+                "template_neo4j_database": {"type": "string"},
+                "template_qdrant_url": {"type": "string"},
+                "template_qdrant_collection": {"type": "string"},
+                "template_qdrant_api_key": {"type": "string"},
             },
             "required": ["action"],
         }
@@ -194,11 +218,11 @@ Actions:
         )
 
     async def _generate_book(self, **kwargs: Any) -> str:
-        book_id = kwargs.get("book_id", "")
+        target_book_id = kwargs.get("target_book_id") or kwargs.get("book_id", "")
         chapter_count = int(kwargs.get("chapter_count", 0))
         output_dir = kwargs.get("output_dir", "")
-        if not book_id or chapter_count <= 0 or not output_dir:
-            return "Error: book_id, chapter_count (>0), and output_dir are required"
+        if not target_book_id or chapter_count <= 0 or not output_dir:
+            return "Error: target_book_id/book_id, chapter_count (>0), and output_dir are required"
         if not kwargs.get("world") and not kwargs.get("world_config"):
             return "Error: world or world_config is required"
 
@@ -210,101 +234,60 @@ Actions:
         if llm_config is None:
             return "Error: llm_config or llm_config_path is required"
 
-        generator_cls = _load_script_class("generate_book_one_click", "OneClickBookGenerator")
-        load_world_spec = _load_script_class("generate_book_one_click", "_load_world_spec")
-
-        world_spec = load_world_spec(kwargs.get("world", ""), kwargs.get("world_config", ""))
-        generator = generator_cls(llm_config=llm_config)
-        blueprint = generator.build_blueprint(
-            book_id=book_id,
-            world_spec=world_spec,
+        runner = _load_script_class("generate_book_ab", "run_generation_with_options")
+        result = runner(
+            book_id=kwargs.get("book_id", ""),
+            target_book_id=target_book_id,
+            template_book_id=kwargs.get("template_book_id", ""),
+            world=kwargs.get("world", ""),
+            world_config=kwargs.get("world_config", ""),
             chapter_count=chapter_count,
             start_chapter=int(kwargs.get("start_chapter", 1)),
-            max_tokens=int(kwargs.get("plan_max_tokens", 4096)),
+            output_dir=output_dir,
+            llm_config_obj=llm_config,
+            llm_config="",
+            llm_config_path="",
+            temperature=float(kwargs.get("temperature", 0.8)),
+            plan_max_tokens=int(kwargs.get("plan_max_tokens", 4096)),
+            chapter_max_tokens=int(kwargs.get("chapter_max_tokens", 4096)),
+            chapter_min_chars=int(kwargs.get("chapter_min_chars", 2800)),
+            chapter_max_chars=int(kwargs.get("chapter_max_chars", 4200)),
+            llm_max_retries=int(kwargs.get("llm_max_retries", 3)),
+            llm_retry_backoff=float(kwargs.get("llm_retry_backoff", 3.0)),
+            llm_backoff_factor=float(kwargs.get("llm_backoff_factor", 2.0)),
+            llm_backoff_max=float(kwargs.get("llm_backoff_max", 60.0)),
+            llm_retry_jitter=float(kwargs.get("llm_retry_jitter", 0.5)),
+            reference_top_k=int(kwargs.get("reference_top_k", 8)),
+            consistency_policy=kwargs.get("consistency_policy", "strict_blocking"),
+            enforce_isolation=bool(kwargs.get("enforce_isolation", True)),
+            resume=bool(kwargs.get("resume", False)),
+            commit_memory=bool(kwargs.get("commit_memory", False)),
+            legacy_canon_db_path=memory_cfg["canon_db_path"],
+            legacy_neo4j_uri=memory_cfg["neo4j_uri"],
+            legacy_neo4j_user=memory_cfg["neo4j_user"],
+            legacy_neo4j_pass=memory_cfg["neo4j_pass"],
+            legacy_neo4j_database=memory_cfg["neo4j_database"],
+            legacy_qdrant_url=memory_cfg["qdrant_url"],
+            legacy_qdrant_collection=memory_cfg["qdrant_collection"],
+            legacy_qdrant_api_key="",
+            target_canon_db_path=kwargs.get("target_canon_db_path", ""),
+            target_neo4j_uri=kwargs.get("target_neo4j_uri", ""),
+            target_neo4j_user=kwargs.get("target_neo4j_user", ""),
+            target_neo4j_pass=kwargs.get("target_neo4j_pass", ""),
+            target_neo4j_database=kwargs.get("target_neo4j_database", ""),
+            target_qdrant_url=kwargs.get("target_qdrant_url", ""),
+            target_qdrant_collection=kwargs.get("target_qdrant_collection", ""),
+            target_qdrant_api_key=kwargs.get("target_qdrant_api_key", ""),
+            template_canon_db_path=kwargs.get("template_canon_db_path", ""),
+            template_neo4j_uri=kwargs.get("template_neo4j_uri", ""),
+            template_neo4j_user=kwargs.get("template_neo4j_user", ""),
+            template_neo4j_pass=kwargs.get("template_neo4j_pass", ""),
+            template_neo4j_database=kwargs.get("template_neo4j_database", ""),
+            template_qdrant_url=kwargs.get("template_qdrant_url", ""),
+            template_qdrant_collection=kwargs.get("template_qdrant_collection", ""),
+            template_qdrant_api_key=kwargs.get("template_qdrant_api_key", ""),
         )
-
-        output_path = Path(output_dir).expanduser()
-        output_path.mkdir(parents=True, exist_ok=True)
-        blueprint_path = output_path / f"{book_id}_blueprint.json"
-        blueprint_path.write_text(json.dumps(blueprint, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        processor = None
-        if kwargs.get("commit_memory"):
-            chapter_processor_cls = _load_script_class("chapter_processor", "ChapterProcessor")
-            processor = chapter_processor_cls(
-                neo4j_uri=memory_cfg["neo4j_uri"],
-                neo4j_user=memory_cfg["neo4j_user"],
-                neo4j_pass=memory_cfg["neo4j_pass"],
-                canon_db_path=memory_cfg["canon_db_path"],
-                qdrant_url=memory_cfg["qdrant_url"],
-                llm_config=llm_config,
-            )
-
-        run_items = []
-        rolling_summaries: list[str] = []
-        try:
-            for chapter in blueprint["chapters"]:
-                chapter_no = chapter["chapter_no"]
-                chapter_title = chapter["title"]
-                chapter_path = output_path / f"{book_id}_chapter_{chapter_no}.md"
-                if kwargs.get("resume") and chapter_path.exists():
-                    run_items.append({"chapter_no": chapter_no, "status": "skipped", "path": str(chapter_path)})
-                    continue
-
-                chapter_text = generator.generate_chapter_text(
-                    world_spec=world_spec,
-                    blueprint=blueprint,
-                    chapter_plan=chapter,
-                    recent_summaries=rolling_summaries,
-                    chapter_min_chars=int(kwargs.get("chapter_min_chars", 2800)),
-                    chapter_max_chars=int(kwargs.get("chapter_max_chars", 4200)),
-                    temperature=float(kwargs.get("temperature", 0.8)),
-                    max_tokens=int(kwargs.get("chapter_max_tokens", 4096)),
-                )
-                summary = generator.summarize_chapter(chapter_title=chapter_title, chapter_text=chapter_text)
-                rolling_summaries.append(f"{chapter_no} {chapter_title}: {summary}")
-                chapter_path.write_text(f"# {chapter_title}\n\n{chapter_text.strip()}\n", encoding="utf-8")
-                item = {
-                    "chapter_no": chapter_no,
-                    "title": chapter_title,
-                    "status": "generated",
-                    "summary": summary,
-                    "path": str(chapter_path),
-                }
-                if processor is not None:
-                    item["memory_commit"] = processor.process_chapter(
-                        book_id=book_id,
-                        chapter_no=chapter_no,
-                        chapter_title=chapter_title,
-                        chapter_summary=summary,
-                        chapter_text=chapter_text,
-                        mode="llm",
-                    )
-                run_items.append(item)
-        finally:
-            if processor is not None:
-                processor.close()
-
-        report = {
-            "book_id": book_id,
-            "chapter_count": chapter_count,
-            "blueprint_path": str(blueprint_path),
-            "items": run_items,
-        }
-        report_path = output_path / f"{book_id}_run_report.json"
-        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        return json.dumps(
-            {
-                "status": "ok",
-                "book_id": book_id,
-                "chapter_count": chapter_count,
-                "output_dir": str(output_path),
-                "blueprint_path": str(blueprint_path),
-                "report_path": str(report_path),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
     def _read_json_file(self, path: str) -> dict[str, Any]:
         content = Path(path).expanduser().read_text(encoding="utf-8")
@@ -319,7 +302,7 @@ Actions:
             "neo4j_uri": getattr(getattr(cfg, "neo4j", None), "uri", "bolt://localhost:7687"),
             "neo4j_user": getattr(getattr(cfg, "neo4j", None), "username", "neo4j"),
             "neo4j_pass": getattr(getattr(cfg, "neo4j", None), "password", ""),
-            "neo4j_db": getattr(getattr(cfg, "neo4j", None), "database", "neo4j"),
+            "neo4j_database": getattr(getattr(cfg, "neo4j", None), "database", "neo4j"),
             "canon_db_path": str(Path(getattr(getattr(cfg, "canon_db", None), "db_path", "~/.nanobot/workspace/canon_v2.db")).expanduser()),
             "qdrant_url": getattr(getattr(cfg, "qdrant", None), "url", ""),
             "qdrant_collection": getattr(getattr(cfg, "qdrant", None), "collection_name", "novel_assets"),
