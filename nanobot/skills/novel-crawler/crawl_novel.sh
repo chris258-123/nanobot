@@ -9,6 +9,7 @@ SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLAYWRIGHT_SCRIPT="${SKILL_DIR}/crawl-chapter-playwright.js"
 CHAPTER_LIST="/tmp/all_chapters.txt"
 TMUX_SESSION="novel_crawler"
+LOG_FILE="${LOG_FILE:-}"
 
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -16,6 +17,11 @@ NC='\033[0m'
 log() {
     echo -e "${GREEN}[$(date '+%H:%M:%S')]${NC} $1"
 }
+
+if [ -n "$LOG_FILE" ]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+    exec > >(tee -a "$LOG_FILE") 2>&1
+fi
 
 mkdir -p "$OUTPUT_DIR"
 

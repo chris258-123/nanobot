@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import httpx
 import json
 import logging
 import os
@@ -12,16 +13,54 @@ import sys
 import time
 from pathlib import Path
 
+from loguru import logger
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from chapter_processor import ChapterProcessor
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-logger = logging.getLogger(__name__)
+# Try to import embedding libraries
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+
+try:
+    from FlagEmbedding import FlagModel
+    FLAG_MODEL_AVAILABLE = True
+except ImportError:
+    FLAG_MODEL_AVAILABLE = False
+
+
+def configure_logger(log_file: str | None):
+    """Configure loguru console/file sinks."""
+    logger.remove()
+    logger.add(
+        sys.stdout,
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
+    )
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            str(log_path),
+            level="INFO",
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
+            rotation="50 MB",
+            encoding="utf-8",
+        )
+
+    class _InterceptHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord):
+            try:
+                level = logger.level(record.levelname).name
+            except Exception:
+                level = record.levelno
+            logger.opt(exception=record.exc_info, depth=6).log(level, record.getMessage())
+
+    logging.basicConfig(handlers=[_InterceptHandler()], level=logging.INFO, force=True)
 
 
 def _parse_chapter_no(path: Path) -> str:
@@ -45,7 +84,7 @@ def _apply_llm_rate_limit(min_interval: float, last_start_at: float | None) -> f
     if min_interval > 0 and last_start_at is not None:
         wait_for = min_interval - (now - last_start_at)
         if wait_for > 0:
-            logger.info("Rate limit sleep %.2fs before next chapter", wait_for)
+            logger.info("Rate limit sleep {:.2f}s before next chapter", wait_for)
             time.sleep(wait_for)
             now = time.monotonic()
     return now
@@ -62,7 +101,7 @@ def _retry_sleep(
     delay = min(base, backoff_max)
     if retry_jitter > 0:
         delay += random.uniform(0, retry_jitter)
-    logger.info("Retry sleep %.2fs before attempt %d", delay, attempt + 1)
+    logger.info("Retry sleep {:.2f}s before attempt {}", delay, attempt + 1)
     time.sleep(delay)
 
 
@@ -117,11 +156,13 @@ def main():
     parser.add_argument("--neo4j-uri", default="bolt://localhost:7687")
     parser.add_argument("--neo4j-user", default="neo4j")
     parser.add_argument("--neo4j-pass", default="novel123")
+    parser.add_argument("--neo4j-database", default="neo4j")
     parser.add_argument("--qdrant-url", default="")
     parser.add_argument("--qdrant-collection", default="novel_assets_v2")
     parser.add_argument("--qdrant-api-key", default="")
     parser.add_argument("--reset-neo4j", action="store_true")
     parser.add_argument("--reset-canon", action="store_true")
+    parser.add_argument("--reset-qdrant", action="store_true", help="Delete and recreate Qdrant collection")
     parser.add_argument("--llm-max-retries", type=int, default=3)
     parser.add_argument("--llm-retry-backoff", type=float, default=3.0)
     parser.add_argument("--llm-backoff-factor", type=float, default=2.0)
@@ -134,7 +175,14 @@ def main():
     parser.add_argument("--context-thread-limit", type=int, default=20)
     parser.add_argument("--max-chapters", type=int, default=0, help="0 means no limit")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress bar output")
+    parser.add_argument("--log-file", default="", help="Optional log file path")
+    parser.add_argument("--embedding-model", default="chinese-large",
+                       choices=["chinese", "chinese-large", "multilingual", "multilingual-large"],
+                       help="Embedding model for Qdrant vectors")
+    parser.add_argument("--skip-embedding", action="store_true",
+                       help="Skip embedding generation (write zero vectors)")
     args = parser.parse_args()
+    configure_logger(args.log_file or None)
 
     if args.mode == "llm" and not args.llm_config:
         raise ValueError("--llm-config is required in llm mode")
@@ -155,13 +203,76 @@ def main():
 
     if args.reset_canon and os.path.exists(args.canon_db_path):
         os.unlink(args.canon_db_path)
-        logger.info("Removed Canon DB: %s", args.canon_db_path)
+        logger.info("Removed Canon DB: {}", args.canon_db_path)
+
+    # Initialize embedding model if needed
+    embedding_model = None
+    use_flag_model = False
+    vector_size = 1024  # Default for chinese-large
+
+    if not args.skip_embedding and args.qdrant_url:
+        logger.info("=" * 60)
+        logger.info("Initializing embedding model for integrated embedding generation")
+        logger.info("=" * 60)
+
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            logger.warning("sentence-transformers not available, falling back to zero vectors")
+            logger.warning("Install with: pip install sentence-transformers")
+        else:
+            # Model selection (from embedder_parallel.py)
+            model_map = {
+                "chinese": ("moka-ai/m3e-base", 768, False),
+                "chinese-large": ("BAAI/bge-large-zh-v1.5", 1024, True),
+                "multilingual": ("paraphrase-multilingual-MiniLM-L12-v2", 384, False),
+                "multilingual-large": ("distiluse-base-multilingual-cased-v2", 512, False)
+            }
+            model_name, vector_size, use_flag_model = model_map[args.embedding_model]
+            logger.info("Selected embedding model: {}", args.embedding_model)
+            logger.info("Model name: {}", model_name)
+            logger.info("Vector dimension: {}", vector_size)
+            logger.info("Use FlagModel optimization: {}", use_flag_model)
+
+            if use_flag_model and FLAG_MODEL_AVAILABLE:
+                logger.info("Loading FlagModel (optimized for BGE models)...")
+                try:
+                    embedding_model = FlagModel(
+                        model_name,
+                        query_instruction_for_retrieval="为这个句子生成表示以用于检索相关文章：",
+                        use_fp16=True
+                    )
+                    logger.info("✓ FlagModel loaded successfully")
+                except Exception as e:
+                    logger.error("Failed to load FlagModel: {}", e)
+                    logger.warning("Falling back to SentenceTransformer")
+                    use_flag_model = False
+                    embedding_model = SentenceTransformer(model_name)
+                    logger.info("✓ SentenceTransformer loaded successfully")
+            elif use_flag_model and not FLAG_MODEL_AVAILABLE:
+                logger.warning("FlagModel requested but not available, falling back to SentenceTransformer")
+                logger.warning("Install with: pip install FlagEmbedding")
+                logger.info("Loading SentenceTransformer...")
+                use_flag_model = False
+                embedding_model = SentenceTransformer(model_name)
+                logger.info("✓ SentenceTransformer loaded successfully")
+            else:
+                logger.info("Loading SentenceTransformer...")
+                embedding_model = SentenceTransformer(model_name)
+                logger.info("✓ SentenceTransformer loaded successfully")
+
+            logger.info("Embedding model initialization complete")
+            logger.info("=" * 60)
+    elif args.skip_embedding:
+        logger.info("Embedding generation skipped (--skip-embedding flag)")
+        logger.info("Qdrant points will be created with zero vectors")
+    elif not args.qdrant_url:
+        logger.info("Qdrant URL not specified, skipping embedding generation")
 
     processor = ChapterProcessor(
         neo4j_uri=args.neo4j_uri,
         neo4j_user=args.neo4j_user,
         neo4j_pass=args.neo4j_pass,
         canon_db_path=args.canon_db_path,
+        neo4j_database=args.neo4j_database,
         qdrant_url=args.qdrant_url or None,
         qdrant_collection=args.qdrant_collection,
         qdrant_api_key=args.qdrant_api_key,
@@ -170,6 +281,9 @@ def main():
         context_state_limit=args.context_state_limit,
         context_relation_limit=args.context_relation_limit,
         context_thread_limit=args.context_thread_limit,
+        embedding_model=embedding_model,
+        use_flag_model=use_flag_model,
+        vector_size=vector_size,
     )
 
     if args.reset_neo4j:
@@ -177,23 +291,57 @@ def main():
         processor.neo4j.clear_all()
         processor.neo4j._init_schema()
 
+    if args.reset_qdrant and args.qdrant_url:
+        logger.info("Resetting Qdrant collection: {}", args.qdrant_collection)
+        try:
+            # Delete existing collection
+            response = httpx.delete(
+                f"{args.qdrant_url}/collections/{args.qdrant_collection}",
+                timeout=30.0,
+                trust_env=False,
+            )
+            if response.status_code == 200:
+                logger.info("✓ Deleted existing Qdrant collection")
+            elif response.status_code == 404:
+                logger.info("Collection does not exist, will create new one")
+            else:
+                logger.warning("Unexpected response when deleting collection: {}", response.status_code)
+
+            # Create new collection with correct vector size
+            response = httpx.put(
+                f"{args.qdrant_url}/collections/{args.qdrant_collection}",
+                json={
+                    "vectors": {
+                        "size": vector_size,
+                        "distance": "Cosine"
+                    }
+                },
+                timeout=30.0,
+                trust_env=False,
+            )
+            response.raise_for_status()
+            logger.info("✓ Created new Qdrant collection (vector_size={})", vector_size)
+        except Exception as e:
+            logger.error("Failed to reset Qdrant collection: {}", e)
+            raise
+
     total = {"entities": 0, "facts": 0, "relations": 0, "events": 0}
     errors: list[tuple[str, str]] = []
 
     try:
         if args.mode == "replay":
             commits = processor.canon_db.replay_from_commit(args.book_id, args.from_chapter)
-            logger.info("Found %d commits to replay", len(commits))
+            logger.info("Found {} commits to replay", len(commits))
             progress = ProgressBar(len(commits), enabled=not args.no_progress)
             for idx, commit in enumerate(commits, 1):
                 commit_id = commit["commit_id"]
                 chapter_no = commit["chapter_no"]
                 try:
                     processor.replay_commit(commit_id)
-                    logger.info("[%d/%d] replay %s (%s) ok", idx, len(commits), chapter_no, commit_id[:8])
+                    logger.info("[{}/{}] replay {} ({}) ok", idx, len(commits), chapter_no, commit_id[:8])
                     progress.update(chapter_no, "ok")
                 except Exception as exc:  # pragma: no cover - operational path
-                    logger.exception("Replay failed for chapter %s", chapter_no)
+                    logger.exception("Replay failed for chapter {}", chapter_no)
                     errors.append((chapter_no, str(exc)))
                     progress.update(chapter_no, "err")
         elif args.mode == "delta":
@@ -201,7 +349,7 @@ def main():
             asset_files = [path for path in asset_files if _parse_chapter_no(path) >= args.from_chapter]
             if args.max_chapters > 0:
                 asset_files = asset_files[: args.max_chapters]
-            logger.info("Found %d asset files", len(asset_files))
+            logger.info("Found {} asset files", len(asset_files))
             progress = ProgressBar(len(asset_files), enabled=not args.no_progress)
             for idx, asset_file in enumerate(asset_files, 1):
                 chapter_no = _parse_chapter_no(asset_file)
@@ -214,7 +362,7 @@ def main():
                     for key in total:
                         total[key] += int(result.get(key, 0))
                     logger.info(
-                        "[%d/%d] %s entities=%s facts=%s relations=%s events=%s",
+                        "[{}/{}] {} entities={} facts={} relations={} events={}",
                         idx,
                         len(asset_files),
                         chapter_no,
@@ -225,7 +373,7 @@ def main():
                     )
                     progress.update(chapter_no, "ok")
                 except Exception as exc:  # pragma: no cover - operational path
-                    logger.exception("Delta processing failed for chapter %s", chapter_no)
+                    logger.exception("Delta processing failed for chapter {}", chapter_no)
                     errors.append((chapter_no, str(exc)))
                     progress.update(chapter_no, "err")
         else:
@@ -239,9 +387,9 @@ def main():
             source_files = [path for path in source_files if _parse_chapter_no(path) >= args.from_chapter]
             if args.max_chapters > 0:
                 source_files = source_files[: args.max_chapters]
-            logger.info("Found %d %s", len(source_files), source_label)
+            logger.info("Found {} {}", len(source_files), source_label)
             logger.info(
-                "LLM settings: max_tokens=%d context=(%d,%d,%d) retries=%d backoff=%.2fs factor=%.2f max=%.2fs jitter=%.2fs min_interval=%.2fs",
+                "LLM settings: max_tokens={} context=({},{},{}) retries={} backoff={:.2f}s factor={:.2f} max={:.2f}s jitter={:.2f}s min_interval={:.2f}s",
                 args.llm_max_tokens,
                 args.context_state_limit,
                 args.context_relation_limit,
@@ -279,7 +427,7 @@ def main():
                         if result.get("status") == "blocked":
                             message = f"blocked by conflicts: {result.get('conflicts')}"
                             logger.error(
-                                "[%d/%d] %s %s (attempt %d/%d)",
+                                "[{}/{}] {} {} (attempt {}/{})",
                                 idx,
                                 len(source_files),
                                 chapter_no,
@@ -294,7 +442,7 @@ def main():
                         for key in total:
                             total[key] += int(result.get(key, 0))
                         logger.info(
-                            "[%d/%d] %s entities=%s facts=%s relations=%s events=%s (attempt %d/%d)",
+                            "[{}/{}] {} entities={} facts={} relations={} events={} (attempt {}/{})",
                             idx,
                             len(source_files),
                             chapter_no,
@@ -312,7 +460,7 @@ def main():
                         is_last_attempt = attempt >= attempts
                         if is_last_attempt:
                             logger.exception(
-                                "LLM processing failed for chapter %s after %d/%d attempts",
+                                "LLM processing failed for chapter {} after {}/{} attempts",
                                 chapter_no,
                                 attempt,
                                 attempts,
@@ -321,7 +469,7 @@ def main():
                             break
 
                         logger.warning(
-                            "LLM processing failed for chapter %s attempt %d/%d: %s",
+                            "LLM processing failed for chapter {} attempt {}/{}: {}",
                             chapter_no,
                             attempt,
                             attempts,
@@ -342,13 +490,13 @@ def main():
                     progress.update(chapter_no, "err")
 
         logger.info("=" * 60)
-        logger.info("Batch run complete mode=%s errors=%d", args.mode, len(errors))
-        logger.info("Totals: %s", total)
-        logger.info("Canon stats: %s", processor.canon_db.get_statistics())
-        logger.info("Neo4j stats: %s", processor.neo4j.get_statistics())
+        logger.info("Batch run complete mode={} errors={}", args.mode, len(errors))
+        logger.info("Totals: {}", total)
+        logger.info("Canon stats: {}", processor.canon_db.get_statistics())
+        logger.info("Neo4j stats: {}", processor.neo4j.get_statistics())
 
         if errors:
-            logger.warning("Failed chapters: %s", errors)
+            logger.warning("Failed chapters: {}", errors)
             return 1
         return 0
     finally:

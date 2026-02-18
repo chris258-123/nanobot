@@ -386,6 +386,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neo4j-uri", default="bolt://localhost:7687")
     parser.add_argument("--neo4j-user", default="neo4j")
     parser.add_argument("--neo4j-pass", default="novel123")
+    parser.add_argument("--neo4j-database", default="neo4j")
     parser.add_argument("--qdrant-url", default="")
     return parser.parse_args()
 
@@ -441,6 +442,7 @@ def main() -> int:
             neo4j_user=args.neo4j_user,
             neo4j_pass=args.neo4j_pass,
             canon_db_path=str(Path(args.canon_db_path).expanduser()),
+            neo4j_database=args.neo4j_database,
             qdrant_url=args.qdrant_url or None,
             llm_config=llm_config,
         )

@@ -91,10 +91,28 @@ class DeltaExtractorLLM:
         return json.loads(repaired)
 
     def _call_llm(self, prompt: str) -> str:
+        def _pop_proxy_env() -> dict[str, str]:
+            backup: dict[str, str] = {}
+            for key in (
+                "ALL_PROXY",
+                "all_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+            ):
+                value = os.environ.pop(key, None)
+                if value is not None:
+                    backup[key] = value
+            return backup
+
+        def _restore_proxy_env(backup: dict[str, str]) -> None:
+            for key, value in backup.items():
+                os.environ[key] = value
+
         # Mode A: same as 8-element extractor (llm_config.json custom endpoint)
         if self.llm_config.get("type") == "custom":
-            old_all_proxy = os.environ.pop("ALL_PROXY", None)
-            old_all_proxy_lower = os.environ.pop("all_proxy", None)
+            proxy_backup = _pop_proxy_env()
             try:
                 response = httpx.post(
                     self.llm_config["url"],
@@ -110,10 +128,7 @@ class DeltaExtractorLLM:
                 response.raise_for_status()
                 return response.json()["choices"][0]["message"]["content"]
             finally:
-                if old_all_proxy:
-                    os.environ["ALL_PROXY"] = old_all_proxy
-                if old_all_proxy_lower:
-                    os.environ["all_proxy"] = old_all_proxy_lower
+                _restore_proxy_env(proxy_backup)
 
         # Mode B: providers + model config (anthropic/openai style)
         if self.llm_config.get("providers") and self.llm_config.get("model"):
@@ -132,18 +147,27 @@ class DeltaExtractorLLM:
                 default_model=self.llm_config["model"],
                 extra_headers=extra_headers,
             )
-            chat_coro = provider.chat(
-                messages=[{"role": "user", "content": prompt}],
-                model=self.llm_config["model"],
-                max_tokens=self.max_tokens,
-                temperature=0.1,
-            )
+            async def _chat_with_timeout():
+                return await asyncio.wait_for(
+                    provider.chat(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=self.llm_config["model"],
+                        max_tokens=self.max_tokens,
+                        temperature=0.1,
+                    ),
+                    timeout=self.timeout,
+                )
+
+            proxy_backup = _pop_proxy_env()
             try:
-                asyncio.get_running_loop()
-                with ThreadPoolExecutor(max_workers=1) as pool:
-                    response = pool.submit(lambda: asyncio.run(chat_coro)).result()
-            except RuntimeError:
-                response = asyncio.run(chat_coro)
+                try:
+                    asyncio.get_running_loop()
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        response = pool.submit(lambda: asyncio.run(_chat_with_timeout())).result()
+                except RuntimeError:
+                    response = asyncio.run(_chat_with_timeout())
+            finally:
+                _restore_proxy_env(proxy_backup)
             return response.content or ""
 
         raise ValueError("Unsupported llm_config: expected {type: custom} or {providers, model}")

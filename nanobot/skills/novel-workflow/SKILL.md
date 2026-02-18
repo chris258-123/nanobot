@@ -1,152 +1,264 @@
 ---
 name: novel-workflow
-description: Run the novel three-tier memory workflow (LLM delta -> Canon -> Neo4j -> Qdrant), plus A-read/B-write one-click generation.
+description: Novel memory pipeline: Book A asset/memory build + strict A/B isolated Book B generation.
 metadata: {"nanobot":{"emoji":"📚","os":["darwin","linux"],"requires":{"bins":["python3"]}}}
 ---
 
 # Novel Workflow Skill
 
-Use this skill for two production paths:
-- Build/maintain the external memory warehouse from an existing novel (Book A)
-- One-click generate a new novel (Book B) with isolated memory writes
+Use this skill after chapters are already crawled/cleaned. It focuses on Book A memory build and strict A(read)-B(write) generation.
 
-## Quickstart: build Book A memory warehouse
+For crawling and chapter cleanup, use `nanobot/skills/novel-crawler/SKILL.md`.
+
+## Workflow Map
+
+1) Extract 8-element assets + embed into Qdrant
+2) Build Book A three-tier memory (Canon + Neo4j + Qdrant)
+3) Generate Book B with strict physical isolation and memory commits
+4) Resume/visualize/verify
+
+## Prerequisites
+
+- Python env ready (`pip install -e ".[dev]"`)
+- Qdrant running (default `http://localhost:6333`)
+- Neo4j-A running (example `bolt://localhost:7687`)
+- Neo4j-B running on a different URI/instance (example `bolt://localhost:7689`)
+- LLM config file ready (recommended: `/home/chris/Desktop/my_workspace/nanobot/nanobot/skills/novel-workflow/llm_config.json`)
+
+### Connectivity fix for `chinese-large` embedding (important)
+
+When using `--embedding-model chinese-large` (`BAAI/bge-large-zh-v1.5`), model download/load goes through HuggingFace.
+If your shell has `ALL_PROXY`/`all_proxy` set to `socks://...`, `httpx` may fail with:
+
+- `ValueError: Unknown scheme for proxy URL URL('socks://...')`
+
+Use this fix before running workflow commands:
+
+```bash
+unset ALL_PROXY all_proxy
+```
+
+Then run commands normally (keep `HTTP_PROXY`/`HTTPS_PROXY` if you need them), for example:
+
+```bash
+unset ALL_PROXY all_proxy
+python nanobot/skills/novel-workflow/scripts/reprocess_all.py \
+  --mode llm \
+  --embedding-model chinese-large \
+  ...
+```
+
+LLM config example (custom endpoint mode):
+
+```json
+{
+  "type": "custom",
+  "url": "https://api.deepseek.com/v1/chat/completions",
+  "model": "deepseek-chat",
+  "api_key": "YOUR_API_KEY"
+}
+```
+
+## 1) Extract 8 Elements (Optional - for separate asset extraction)
+
+**Note:** With the new integrated embedding in `reprocess_all.py`, you can skip this step and use `--mode llm` with `--chapter-dir` directly. This section is for advanced workflows that need separate asset extraction.
+
+```bash
+python nanobot/skills/novel-workflow/scripts/asset_extractor_parallel.py \
+  --book-id novel_a \
+  --chapter-dir /path/to/novel_a_chapters \
+  --output-dir /path/to/novel_a_assets \
+  --llm-config /home/chris/Desktop/my_workspace/nanobot/nanobot/skills/novel-workflow/llm_config.json \
+  --workers 8 \
+  --log-file /path/to/logs/asset_extract.log
+
+# Optional: align asset filenames to chapter IDs
+python nanobot/skills/novel-workflow/scripts/rename_assets_by_chapter_id.py \
+  /path/to/novel_a_chapters /path/to/novel_a_assets
+
+# Optional: separate embedding step (only if using --skip-embedding in reprocess_all.py)
+python nanobot/skills/novel-workflow/scripts/embedder_parallel.py \
+  --assets-dir /path/to/novel_a_assets \
+  --book-id novel_a \
+  --qdrant-url http://localhost:6333 \
+  --collection novel_a_assets \
+  --model chinese-large \
+  --workers 5
+```
+
+## 2) Build Book A Three-Tier Memory Warehouse
+
+`reprocess_all.py` is the canonical batch entry with integrated embedding generation.
+
+Recommended mode (quality-first): use `--chapter-dir` (better chunk evidence chain).
 
 ```bash
 python nanobot/skills/novel-workflow/scripts/reprocess_all.py \
   --mode llm \
-  --book-id novel_04_memory \
-  --asset-dir /home/chris/novel_assets_enhanced \
+  --book-id novel_a \
+  --chapter-dir /path/to/novel_a_chapters \
   --from-chapter 0001 \
-  --llm-config /tmp/llm_config_claude.json \
-  --canon-db-path /tmp/canon_v2_novel_04_memory.db \
+  --llm-config /home/chris/Desktop/my_workspace/nanobot/nanobot/skills/novel-workflow/llm_config.json \
+  --canon-db-path /tmp/canon_novel_a.db \
+  --neo4j-uri bolt://localhost:7687 \
+  --neo4j-user neo4j \
+  --neo4j-pass novel123 \
+  --neo4j-database neo4j \
   --qdrant-url http://localhost:6333 \
-  --qdrant-collection novel_assets_v2 \
+  --qdrant-collection novel_a_assets \
+  --embedding-model chinese-large \
   --llm-max-retries 3 \
   --llm-retry-backoff 3 \
   --llm-backoff-factor 2 \
   --llm-backoff-max 60 \
   --llm-retry-jitter 0.5 \
-  --llm-min-interval 1.0
+  --llm-min-interval 1.0 \
+  --reset-canon \
+  --reset-neo4j \
+  --reset-qdrant \
+  --log-file /path/to/logs/reprocess.log
 ```
 
-Progress bar is built in:
+Speed-first alternative (if you already have high-quality assets): replace `--chapter-dir` with `--asset-dir /path/to/novel_a_assets`.
 
-```text
-[==========--------------------] 120/985  12.2% elapsed=00:48:12 eta=05:46:03 last=0120 status=ok
-```
+**New Embedding Integration Features:**
 
-Resume after interruption (no reset flags):
+- `--embedding-model`: Choose embedding model (chinese, chinese-large, multilingual, multilingual-large)
+  - `chinese`: moka-ai/m3e-base (768-dim)
+  - `chinese-large`: BAAI/bge-large-zh-v1.5 (1024-dim, default)
+  - `multilingual`: paraphrase-multilingual-MiniLM-L12-v2 (384-dim)
+  - `multilingual-large`: distiluse-base-multilingual-cased-v2 (512-dim)
+- `--skip-embedding`: Skip embedding generation and write zero vectors (old behavior)
+
+**Benefits:**
+- Qdrant points are immediately searchable (no separate embedder step needed)
+- Consistent embedding model configuration
+- Simplified workflow (one command instead of two)
+
+**Backward Compatibility:**
+- Use `--skip-embedding` to preserve old two-step workflow
+- Separate `embedder_parallel.py` still available for re-embedding existing points
+
+Resume from breakpoint:
 
 ```bash
 python nanobot/skills/novel-workflow/scripts/reprocess_all.py \
   --mode llm \
-  --book-id novel_04_memory \
-  --asset-dir /home/chris/novel_assets_enhanced \
+  --book-id novel_a \
+  --chapter-dir /path/to/novel_a_chapters \
   --from-chapter 0121 \
-  --llm-config /tmp/llm_config_claude.json \
-  --canon-db-path /tmp/canon_v2_novel_04_memory.db \
+  --llm-config /home/chris/Desktop/my_workspace/nanobot/nanobot/skills/novel-workflow/llm_config.json \
+  --canon-db-path /tmp/canon_novel_a.db \
+  --neo4j-uri bolt://localhost:7687 \
+  --neo4j-user neo4j \
+  --neo4j-pass novel123 \
+  --neo4j-database neo4j \
   --qdrant-url http://localhost:6333 \
-  --qdrant-collection novel_assets_v2
+  --qdrant-collection novel_a_assets \
+  --embedding-model chinese-large \
+  --log-file /path/to/logs/reprocess_resume.log
 ```
 
-## Quickstart: one-click Book B generation (A-read/B-write)
+## 3) Generate Book B with Strict A/B Isolation
 
-Recommended: strict isolation (Book A read-only, Book B write-only).
+Use `generate_book_ab.py` for A-read/B-write one-click generation + commit-memory.
 
 ```bash
 python nanobot/skills/novel-workflow/scripts/generate_book_ab.py \
-  --target-book-id novel_new_01 \
-  --template-book-id novel_04_memory \
+  --target-book-id novel_b \
+  --template-book-id novel_a \
   --world-config nanobot/skills/novel-workflow/templates/world_spec.example.json \
   --chapter-count 20 \
   --start-chapter 1 \
-  --output-dir /tmp/novel_new_01 \
-  --llm-config /tmp/llm_config_claude.json \
+  --output-dir /tmp/novel_b \
+  --llm-config /home/chris/Desktop/my_workspace/nanobot/nanobot/skills/novel-workflow/llm_config.json \
   --commit-memory \
+  --consistency-policy warn_only \
   --enforce-isolation \
-  --template-canon-db-path /tmp/canon_v2_novel_04_memory.db \
-  --target-canon-db-path /tmp/canon_v2_novel_new_01.db \
+  --template-semantic-search \
+  --template-semantic-model chinese-large \
+  --reference-top-k 8 \
+  --llm-max-retries 3 \
+  --llm-retry-backoff 3 \
+  --llm-backoff-factor 2 \
+  --llm-backoff-max 60 \
+  --llm-retry-jitter 0.5 \
+  --template-canon-db-path /tmp/canon_novel_a.db \
+  --template-neo4j-uri bolt://localhost:7687 \
+  --template-neo4j-user neo4j \
+  --template-neo4j-pass novel123 \
+  --template-neo4j-database neo4j \
   --template-qdrant-url http://localhost:6333 \
-  --template-qdrant-collection novel_assets_v2 \
+  --template-qdrant-collection novel_a_assets \
+  --target-canon-db-path /tmp/canon_novel_b.db \
+  --target-neo4j-uri bolt://localhost:7689 \
+  --target-neo4j-user neo4j \
+  --target-neo4j-pass novel123 \
+  --target-neo4j-database neo4j \
   --target-qdrant-url http://localhost:6333 \
-  --target-qdrant-collection novel_new_01_assets_v2
+  --target-qdrant-collection novel_b_assets \
+  --log-dir /home/chris/Desktop/my_workspace/nanobot/logs \
+  --log-injections
 ```
 
-Outputs:
-- `<output_dir>/<target_book_id>_blueprint.json`
-- `<output_dir>/<target_book_id>_chapter_0001.md` ... chapter files
-- `<output_dir>/<target_book_id>_run_report.json`
+Resume generation:
 
-## Modes and core scripts
+```bash
+python nanobot/skills/novel-workflow/scripts/generate_book_ab.py ... --resume
+```
 
-- `scripts/reprocess_all.py`: batch processing (`--mode llm|delta|replay`)
-- `scripts/chapter_processor.py`: chapter commit orchestration
-- `scripts/delta_extractor_llm.py`: LLM delta extraction
-- `scripts/canon_db_v2.py`: authoritative Canon DB + commit log + replay
-- `scripts/neo4j_manager.py`: structural graph memory
-- `scripts/generate_book_ab.py`: one-click A-read/B-write generation
-- `scripts/visualize_canon_db.py`: Canon stats and charts
-- `scripts/visualize_neo4j.py`: Neo4j network/timeline charts
+## Isolation Rules (Critical)
 
-Legacy asset/retrieval scripts (still supported):
-- `scripts/asset_extractor_parallel.py`: 8-element extraction
-- `scripts/embedder_parallel.py`: embedding pipeline
-- `scripts/hybrid_search.py`: hybrid retrieval helper
+For `--commit-memory`, A and B must be physically isolated:
 
-## Visualize current state
+- Canon: different `.db` files
+- Neo4j: different URI/instance (recommended) and/or dedicated database
+- Qdrant: different collections
+
+Do not reuse A targets as B write targets.
+
+## 4) Visualization & Validation
+
+Canon stats/charts:
 
 ```bash
 python nanobot/skills/novel-workflow/scripts/visualize_canon_db.py \
-  --db-path /tmp/canon_v2_novel_04_memory.db
+  --db-path /tmp/canon_novel_b.db
 ```
+
+Neo4j Book-B-only charts:
 
 ```bash
 python nanobot/skills/novel-workflow/scripts/visualize_neo4j.py \
-  --uri bolt://localhost:7687 \
+  --uri bolt://localhost:7689 \
   --username neo4j \
-  --password novel123
+  --password novel123 \
+  --book-id novel_b \
+  --canon-db-path /tmp/canon_novel_b.db \
+  --protagonist-name 主角名
 ```
 
-## LLM config formats
+## Logs and Outputs
 
-Providers mode (Claude proxy):
+`generate_book_ab.py` writes:
 
-```json
-{
-  "providers": {
-    "anthropic": {
-      "apiKey": "YOUR_API_KEY",
-      "apiBase": "https://your-proxy-base",
-      "extraHeaders": null
-    }
-  },
-  "model": "claude-sonnet-4-5",
-  "max_tokens": 4096
-}
-```
+- Blueprint: `<output_dir>/<target_book_id>_blueprint.json`
+- Chapters: `<output_dir>/<target_book_id>_chapter_0001.md` ...
+- Run report: `<output_dir>/<target_book_id>_run_report.json`
+- Injection logs: `<log_dir>/generate_book_ab/<target_book_id>_<timestamp>/`
 
-Custom mode:
+## If Book A Neo4j Is Polluted
 
-```json
-{
-  "type": "custom",
-  "url": "https://your-endpoint/v1/chat/completions",
-  "model": "claude-sonnet-4-5",
-  "api_key": "YOUR_API_KEY",
-  "max_tokens": 4096
-}
-```
+Rebuild a clean Book A warehouse to a fresh target set:
 
-## Troubleshooting
+- New Canon DB path
+- New Qdrant collection
+- New Neo4j instance/database
+- Re-run `reprocess_all.py --mode llm --reset-canon --reset-neo4j`
 
-- `chapter_xxxx.md` missing: check `--llm-config` path and API key validity
-- `Isolation check failed`: set separate Book A/Book B Canon/Neo4j/Qdrant targets
-- Graph names garbled: ensure UTF-8 data source and font support in visualization environment
-- Batch run interrupted: resume with `--from-chapter` and the same target Canon DB
+Then point future Book B generations to this clean Book A template store.
 
-## Safety
+## Security
 
-- Never commit API keys or DB runtime files
-- Keep secrets in local files or environment variables
-- Redact tokens and endpoints before sharing logs
+- Never commit API keys, DB files, or runtime logs with secrets.
+- Keep secrets in local files/env vars.

@@ -60,6 +60,7 @@ class ChapterProcessor:
         neo4j_user: str,
         neo4j_pass: str,
         canon_db_path: str,
+        neo4j_database: str = "neo4j",
         qdrant_url: Optional[str] = None,
         qdrant_collection: str = "novel_assets_v2",
         qdrant_api_key: str = "",
@@ -68,8 +69,11 @@ class ChapterProcessor:
         context_state_limit: int = 30,
         context_relation_limit: int = 30,
         context_thread_limit: int = 20,
+        embedding_model=None,
+        use_flag_model: bool = False,
+        vector_size: int = 1024,
     ):
-        self.neo4j = Neo4jManager(neo4j_uri, neo4j_user, neo4j_pass)
+        self.neo4j = Neo4jManager(neo4j_uri, neo4j_user, neo4j_pass, neo4j_database)
         self.canon_db = CanonDBV2(canon_db_path)
         self.qdrant_url = (qdrant_url or "").rstrip("/")
         self.qdrant_collection = qdrant_collection
@@ -80,9 +84,26 @@ class ChapterProcessor:
         self.context_state_limit = context_state_limit
         self.context_relation_limit = context_relation_limit
         self.context_thread_limit = context_thread_limit
+        self.embedding_model = embedding_model
+        self.use_flag_model = use_flag_model
+        self.vector_size = vector_size
         self.delta_extractor = (
             DeltaExtractorLLM(llm_config, max_tokens=llm_max_tokens) if llm_config else None
         )
+
+        # Log embedding configuration
+        if self.qdrant_url:
+            if self.embedding_model is not None:
+                logger.info("ChapterProcessor initialized with embedding model")
+                logger.info("  - Embedding model type: %s", "FlagModel" if use_flag_model else "SentenceTransformer")
+                logger.info("  - Vector size: %d", vector_size)
+                logger.info("  - Qdrant collection: %s", qdrant_collection)
+            else:
+                logger.info("ChapterProcessor initialized without embedding model (zero vectors)")
+                logger.info("  - Vector size: %d", vector_size)
+                logger.info("  - Qdrant collection: %s", qdrant_collection)
+        else:
+            logger.info("ChapterProcessor initialized without Qdrant integration")
 
     def close(self):
         """Close all connections."""
@@ -90,7 +111,11 @@ class ChapterProcessor:
         self.canon_db.close()
 
     def create_chunks(
-        self, chapter_text: str, chapter_no: str, max_chars: int = 550
+        self,
+        chapter_text: str,
+        chapter_no: str,
+        max_chars: int = 550,
+        book_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Split chapter into punctuation-aware chunks with stable IDs."""
         chapter_text = (chapter_text or "").strip()
@@ -104,6 +129,7 @@ class ChapterProcessor:
         cursor = 0
         chunk_index = 0
 
+        chunk_prefix = f"{book_id}:{chapter_no}" if book_id else chapter_no
         for unit in units:
             if not unit:
                 continue
@@ -111,7 +137,7 @@ class ChapterProcessor:
                 text = "".join(buffer).strip()
                 chunks.append(
                     {
-                        "chunk_id": f"{chapter_no}#c{chunk_index:02d}",
+                        "chunk_id": f"{chunk_prefix}#c{chunk_index:02d}",
                         "text": text,
                         "start_pos": cursor - len(text),
                         "end_pos": cursor,
@@ -129,7 +155,7 @@ class ChapterProcessor:
             text = "".join(buffer).strip()
             chunks.append(
                 {
-                    "chunk_id": f"{chapter_no}#c{chunk_index:02d}",
+                    "chunk_id": f"{chunk_prefix}#c{chunk_index:02d}",
                     "text": text,
                     "start_pos": max(cursor - len(text), 0),
                     "end_pos": cursor,
@@ -541,7 +567,11 @@ class ChapterProcessor:
                     "traits": {},
                     "status": "active",
                 }
-            resolved["fact_changes"].append({**fact, "subject_id": subject_id})
+            resolved["fact_changes"].append({
+                **fact,
+                "subject_id": subject_id,
+                "subject_name": entity_meta[subject_id]["name"],
+            })
 
         for rel in delta.get("relations_delta", []):
             from_id = resolve_ref(rel.get("from_name"), rel.get("from_id"), "character")
@@ -562,7 +592,13 @@ class ChapterProcessor:
                         "traits": {},
                         "status": "active",
                     }
-            resolved["relations_delta"].append({**rel, "from_id": from_id, "to_id": to_id})
+            resolved["relations_delta"].append({
+                **rel,
+                "from_id": from_id,
+                "to_id": to_id,
+                "from_name": entity_meta[from_id]["name"],
+                "to_name": entity_meta[to_id]["name"],
+            })
 
         for event in delta.get("events", []):
             participant_ids = []
@@ -636,7 +672,11 @@ class ChapterProcessor:
 
         if not self.llm_config:
             raise ValueError("llm_config is required for asset extraction")
-        return extract_all_assets(chapter_text, self.llm_config)
+        try:
+            return extract_all_assets(chapter_text, self.llm_config)
+        except Exception:
+            logger.exception("asset extraction failed; fallback to empty assets")
+            return {}
 
     def _qdrant_headers(self) -> dict[str, str]:
         return {"api-key": self.qdrant_api_key} if self.qdrant_api_key else {}
@@ -648,6 +688,7 @@ class ChapterProcessor:
             f"{self.qdrant_url}/collections/{self.qdrant_collection}",
             headers=self._qdrant_headers(),
             timeout=20.0,
+            trust_env=False,
         )
         response.raise_for_status()
         vectors = response.json().get("result", {}).get("config", {}).get("params", {}).get("vectors")
@@ -655,6 +696,36 @@ class ChapterProcessor:
             vectors = {"size": 384}
         self._qdrant_vector_schema = vectors
         return vectors
+
+    def _generate_embedding(self, text: str) -> list[float]:
+        """Generate embedding for text using the configured model.
+
+        Args:
+            text: Text to embed
+
+        Returns:
+            Embedding vector as list of floats
+        """
+        if self.embedding_model is None:
+            # Return zero vector if no model configured
+            logger.debug("No embedding model configured, returning zero vector (size=%d)", self.vector_size)
+            return [0.0] * self.vector_size
+
+        try:
+            if self.use_flag_model:
+                # FlagModel returns numpy array, need to convert to list
+                logger.debug("Generating embedding with FlagModel (text length: %d chars)", len(text))
+                embedding = self.embedding_model.encode([text])[0].tolist()
+            else:
+                logger.debug("Generating embedding with SentenceTransformer (text length: %d chars)", len(text))
+                embedding = self.embedding_model.encode(text).tolist()
+
+            logger.debug("✓ Embedding generated (vector size: %d)", len(embedding))
+            return embedding
+        except Exception as e:
+            logger.error("Failed to generate embedding: %s", e)
+            logger.warning("Falling back to zero vector")
+            return [0.0] * self.vector_size
 
     def _build_qdrant_vector_payload(self) -> list[float] | dict[str, list[float]]:
         vectors = self._load_qdrant_vector_schema()
@@ -666,7 +737,7 @@ class ChapterProcessor:
                 size = int(spec.get("size", 384)) if isinstance(spec, dict) else 384
                 payload[name] = [0.0] * size
             return payload
-        return [0.0] * 384
+        return [0.0] * self.vector_size
 
     def _stable_point_id(self, *parts: str) -> int:
         digest = hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()
@@ -678,6 +749,7 @@ class ChapterProcessor:
             headers=self._qdrant_headers(),
             json={"points": points},
             timeout=30.0,
+            trust_env=False,
         )
         response.raise_for_status()
 
@@ -694,15 +766,17 @@ class ChapterProcessor:
         if not self.qdrant_url:
             return
 
-        vector_payload = self._build_qdrant_vector_payload()
+        logger.info("[%s] Starting Qdrant write with embedding generation", chapter_no)
         points: list[dict[str, Any]] = []
 
+        # Generate chapter digest point
         digest_text = chapter_summary or (delta.get("events", [{}])[0].get("summary", "") if delta.get("events") else "")
         if digest_text:
+            logger.debug("[%s] Generating embedding for chapter digest", chapter_no)
             points.append(
                 {
                     "id": self._stable_point_id(book_id, chapter_no, "chapter_digest"),
-                    "vector": vector_payload,
+                    "vector": self._generate_embedding(digest_text),
                     "payload": {
                         "book_id": book_id,
                         "chapter": chapter_no,
@@ -714,6 +788,12 @@ class ChapterProcessor:
                     },
                 }
             )
+            logger.debug("[%s] ✓ Chapter digest embedding generated", chapter_no)
+
+        # Generate fact digest points
+        fact_count = len(delta.get("fact_changes", []))
+        if fact_count > 0:
+            logger.debug("[%s] Generating embeddings for %d fact digests", chapter_no, fact_count)
 
         for idx, fact in enumerate(delta.get("fact_changes", []), 1):
             value = json.dumps(fact.get("value"), ensure_ascii=False)
@@ -725,7 +805,7 @@ class ChapterProcessor:
             points.append(
                 {
                     "id": self._stable_point_id(book_id, chapter_no, "fact_digest", str(idx)),
-                    "vector": vector_payload,
+                    "vector": self._generate_embedding(fact_text),
                     "payload": {
                         "book_id": book_id,
                         "chapter": chapter_no,
@@ -741,6 +821,14 @@ class ChapterProcessor:
                 }
             )
 
+        if fact_count > 0:
+            logger.debug("[%s] ✓ %d fact digest embeddings generated", chapter_no, fact_count)
+
+        # Generate relation digest points
+        relation_count = len(delta.get("relations_delta", []))
+        if relation_count > 0:
+            logger.debug("[%s] Generating embeddings for %d relation digests", chapter_no, relation_count)
+
         for idx, rel in enumerate(delta.get("relations_delta", []), 1):
             rel_text = (
                 f"{rel.get('from_name') or rel.get('from_id')} -{rel.get('kind')}/"
@@ -749,7 +837,7 @@ class ChapterProcessor:
             points.append(
                 {
                     "id": self._stable_point_id(book_id, chapter_no, "relation_digest", str(idx)),
-                    "vector": vector_payload,
+                    "vector": self._generate_embedding(rel_text),
                     "payload": {
                         "book_id": book_id,
                         "chapter": chapter_no,
@@ -767,11 +855,253 @@ class ChapterProcessor:
                 }
             )
 
+        if relation_count > 0:
+            logger.debug("[%s] ✓ %d relation digest embeddings generated", chapter_no, relation_count)
+
+        # Generate 8-element narrative asset points
+        asset_counts = {}
+
+        # 1. plot_beat assets
+        plot_beats = assets.get("plot_beats", []) or []
+        for idx, beat in enumerate(plot_beats, 1):
+            if isinstance(beat, dict):
+                # Build comprehensive text: event + impact (matching embedder_parallel.py)
+                event = beat.get("event", "") or beat.get("beat", "") or beat.get("description", "")
+                impact = beat.get("impact", "")
+                beat_text = f"{event} {impact}".strip()
+                characters = beat.get("characters", [])
+            else:
+                beat_text = str(beat)
+                characters = []
+            if beat_text:
+                points.append({
+                    "id": self._stable_point_id(book_id, chapter_no, "plot_beat", str(idx)),
+                    "vector": self._generate_embedding(beat_text),
+                    "payload": {
+                        "book_id": book_id,
+                        "chapter": chapter_no,
+                        "commit_id": commit_id,
+                        "asset_type": "plot_beat",
+                        "memory_type": "plot_beat",
+                        "text": beat_text,
+                        "characters": characters if isinstance(characters, list) else [],
+                        "metadata": beat if isinstance(beat, dict) else {},
+                    },
+                })
+        asset_counts["plot_beat"] = len(plot_beats)
+
+        # 2. character_card assets
+        character_cards = assets.get("character_cards", []) or []
+        for idx, card in enumerate(character_cards, 1):
+            if isinstance(card, dict):
+                # Build comprehensive text: name + traits + state (matching embedder_parallel.py)
+                name = card.get("name", "")
+                traits = card.get("traits", [])
+                traits_text = " ".join(traits) if isinstance(traits, list) else str(traits)
+                state = card.get("state", "")
+                card_text = f"{name}: {traits_text} {state}".strip()
+                characters = [name] if name else []
+            else:
+                card_text = str(card)
+                characters = []
+            if card_text and card_text != ":":
+                points.append({
+                    "id": self._stable_point_id(book_id, chapter_no, "character_card", str(idx)),
+                    "vector": self._generate_embedding(card_text),
+                    "payload": {
+                        "book_id": book_id,
+                        "chapter": chapter_no,
+                        "commit_id": commit_id,
+                        "asset_type": "character_card",
+                        "memory_type": "character_card",
+                        "text": card_text,
+                        "characters": characters,
+                        "metadata": card if isinstance(card, dict) else {},
+                    },
+                })
+        asset_counts["character_card"] = len(character_cards)
+
+        # 3. conflict assets
+        conflicts = assets.get("conflicts", []) or []
+        for idx, conflict in enumerate(conflicts, 1):
+            if isinstance(conflict, dict):
+                # Build comprehensive text: type + description (matching embedder_parallel.py)
+                conflict_type = conflict.get("type", "")
+                description = conflict.get("conflict", "") or conflict.get("description", "")
+                conflict_text = f"{conflict_type} {description}".strip()
+                characters = conflict.get("parties", [])
+            else:
+                conflict_text = str(conflict)
+                characters = []
+            if conflict_text:
+                points.append({
+                    "id": self._stable_point_id(book_id, chapter_no, "conflict", str(idx)),
+                    "vector": self._generate_embedding(conflict_text),
+                    "payload": {
+                        "book_id": book_id,
+                        "chapter": chapter_no,
+                        "commit_id": commit_id,
+                        "asset_type": "conflict",
+                        "memory_type": "conflict",
+                        "text": conflict_text,
+                        "characters": characters if isinstance(characters, list) else [],
+                        "metadata": conflict if isinstance(conflict, dict) else {},
+                    },
+                })
+        asset_counts["conflict"] = len(conflicts)
+
+        # 4. setting assets
+        settings = assets.get("settings", []) or []
+        for idx, setting in enumerate(settings, 1):
+            if isinstance(setting, dict):
+                # Build comprehensive text: location + time + atmosphere (matching embedder_parallel.py)
+                location = setting.get("location", "")
+                time = setting.get("time", "")
+                atmosphere = setting.get("atmosphere", "")
+                setting_text = f"{location} {time} {atmosphere}".strip()
+            else:
+                setting_text = str(setting)
+            if setting_text:
+                points.append({
+                    "id": self._stable_point_id(book_id, chapter_no, "setting", str(idx)),
+                    "vector": self._generate_embedding(setting_text),
+                    "payload": {
+                        "book_id": book_id,
+                        "chapter": chapter_no,
+                        "commit_id": commit_id,
+                        "asset_type": "setting",
+                        "memory_type": "setting",
+                        "text": setting_text,
+                        "characters": [],
+                        "metadata": setting if isinstance(setting, dict) else {},
+                    },
+                })
+        asset_counts["setting"] = len(settings)
+
+        # 5. theme assets
+        themes = assets.get("themes", []) or []
+        for idx, theme in enumerate(themes, 1):
+            if isinstance(theme, dict):
+                # Build comprehensive text: theme + manifestation (matching embedder_parallel.py)
+                theme_text = theme.get("theme", "")
+                manifestation = theme.get("manifestation", "")
+                theme_full_text = f"{theme_text} {manifestation}".strip()
+            else:
+                theme_full_text = str(theme)
+            if theme_full_text:
+                points.append({
+                    "id": self._stable_point_id(book_id, chapter_no, "theme", str(idx)),
+                    "vector": self._generate_embedding(theme_full_text),
+                    "payload": {
+                        "book_id": book_id,
+                        "chapter": chapter_no,
+                        "commit_id": commit_id,
+                        "asset_type": "theme",
+                        "memory_type": "theme",
+                        "text": theme_full_text,
+                        "characters": [],
+                        "metadata": theme if isinstance(theme, dict) else {},
+                    },
+                })
+        asset_counts["theme"] = len(themes)
+
+        # 6. pov asset (single value)
+        pov = assets.get("pov", {}) or assets.get("point_of_view", {})
+        if isinstance(pov, dict):
+            # Build text from all dict values (matching embedder_parallel.py)
+            pov_text = " ".join(str(v) for v in pov.values() if v)
+        else:
+            pov_text = str(pov) if pov else ""
+        if pov_text:
+            points.append({
+                "id": self._stable_point_id(book_id, chapter_no, "pov"),
+                "vector": self._generate_embedding(pov_text),
+                "payload": {
+                    "book_id": book_id,
+                    "chapter": chapter_no,
+                    "commit_id": commit_id,
+                    "asset_type": "pov",
+                    "memory_type": "pov",
+                    "text": pov_text,
+                    "characters": [],
+                    "metadata": pov if isinstance(pov, dict) else {},
+                },
+            })
+            asset_counts["pov"] = 1
+
+        # 7. tone asset (single value)
+        tone = assets.get("tone", {})
+        if isinstance(tone, dict):
+            # Build text from all dict values (matching embedder_parallel.py)
+            tone_text = " ".join(str(v) for v in tone.values() if v)
+        else:
+            tone_text = str(tone) if tone else ""
+        if tone_text:
+            points.append({
+                "id": self._stable_point_id(book_id, chapter_no, "tone"),
+                "vector": self._generate_embedding(tone_text),
+                "payload": {
+                    "book_id": book_id,
+                    "chapter": chapter_no,
+                    "commit_id": commit_id,
+                    "asset_type": "tone",
+                    "memory_type": "tone",
+                    "text": tone_text,
+                    "characters": [],
+                    "metadata": tone if isinstance(tone, dict) else {},
+                },
+            })
+            asset_counts["tone"] = 1
+
+        # 8. style asset (single value)
+        style = assets.get("style", {})
+        if isinstance(style, dict):
+            # Build text from all dict values (matching embedder_parallel.py)
+            style_text = " ".join(str(v) for v in style.values() if v)
+        else:
+            style_text = str(style) if style else ""
+        if style_text:
+            points.append({
+                "id": self._stable_point_id(book_id, chapter_no, "style"),
+                "vector": self._generate_embedding(style_text),
+                "payload": {
+                    "book_id": book_id,
+                    "chapter": chapter_no,
+                    "commit_id": commit_id,
+                    "asset_type": "style",
+                    "memory_type": "style",
+                    "text": style_text,
+                    "characters": [],
+                    "metadata": style if isinstance(style, dict) else {},
+                },
+            })
+            asset_counts["style"] = 1
+
         if not points:
+            logger.debug("[%s] No points to write to Qdrant", chapter_no)
             return
-        self._upsert_qdrant_points(points)
+
         logger.info(
-            "[%s] Qdrant wrote %d points (commit=%s collection=%s)",
+            "[%s] Upserting %d points to Qdrant (digests: chapter=%d fact=%d relation=%d, assets: plot=%d char=%d conflict=%d setting=%d theme=%d pov=%d tone=%d style=%d)",
+            chapter_no,
+            len(points),
+            1 if digest_text else 0,
+            fact_count,
+            relation_count,
+            asset_counts.get("plot_beat", 0),
+            asset_counts.get("character_card", 0),
+            asset_counts.get("conflict", 0),
+            asset_counts.get("setting", 0),
+            asset_counts.get("theme", 0),
+            asset_counts.get("pov", 0),
+            asset_counts.get("tone", 0),
+            asset_counts.get("style", 0),
+        )
+
+        self._upsert_qdrant_points(points)
+
+        logger.info(
+            "[%s] ✓ Qdrant write complete: %d points (commit=%s collection=%s)",
             chapter_no,
             len(points),
             commit_id[:8],
@@ -792,7 +1122,7 @@ class ChapterProcessor:
         stats = {"entities": 0, "relations": 0, "events": 0}
         self.neo4j.create_chapter(book_id, chapter_no, chapter_title, None, chapter_summary)
         if chunks:
-            self.neo4j.create_chunks(chapter_no, chunks)
+            self.neo4j.create_chunks(book_id, chapter_no, chunks)
 
         for entity_id, meta in entity_meta.items():
             self.neo4j.upsert_entity(
@@ -824,6 +1154,7 @@ class ChapterProcessor:
                 event_id=event["event_id"],
                 event_type=event.get("type", "plot_beat"),
                 summary=event.get("summary", ""),
+                book_id=book_id,
                 chapter_no=chapter_no,
                 participants=event.get("participants", []),
                 location_id=None,
@@ -844,6 +1175,7 @@ class ChapterProcessor:
             self.neo4j.create_hook(
                 hook_id,
                 hook.get("summary", ""),
+                book_id,
                 chapter_no,
                 thread_id,
                 hook.get("evidence_chunk_id"),
@@ -867,29 +1199,34 @@ class ChapterProcessor:
         - `mode="delta"`: use provided delta; if missing and assets exist, derive from assets.
         - `mode="llm"`: chapter text -> assets(optional) -> LLM delta extractor.
         """
-        chunks = self.create_chunks(chapter_text, chapter_no) if chapter_text else []
+        chunks = self.create_chunks(chapter_text, chapter_no, book_id=book_id) if chapter_text else []
         default_chunk_id = chunks[0]["chunk_id"] if chunks else f"{chapter_no}#c00"
 
         if mode == "llm":
-            if not chapter_text and assets is None:
+            if not chapter_text and not assets:
                 raise ValueError("chapter_text or assets is required in llm mode")
             if not self.delta_extractor:
                 raise ValueError("llm_config is required in ChapterProcessor for llm mode")
-            assets = assets or self._extract_assets(chapter_text)
-            prev_context = self.canon_db.get_prev_context_snapshot(
-                chapter_no,
-                state_limit=self.context_state_limit,
-                relation_limit=self.context_relation_limit,
-                thread_limit=self.context_thread_limit,
-            )
-            delta_raw = self.delta_extractor.extract(
-                chapter_no=chapter_no,
-                chapter_text=chapter_text,
-                chunks=chunks,
-                assets=assets or {},
-                prev_context=prev_context,
-            )
-            delta = self._normalize_delta(delta_raw, chapter_no, default_chunk_id, assets=assets)
+            if delta is None:
+                # In llm mode, empty assets means "extract assets first", not "use empty delta".
+                if not assets:
+                    assets = self._extract_assets(chapter_text)
+                prev_context = self.canon_db.get_prev_context_snapshot(
+                    chapter_no,
+                    state_limit=self.context_state_limit,
+                    relation_limit=self.context_relation_limit,
+                    thread_limit=self.context_thread_limit,
+                )
+                delta_raw = self.delta_extractor.extract(
+                    chapter_no=chapter_no,
+                    chapter_text=chapter_text,
+                    chunks=chunks,
+                    assets=assets or {},
+                    prev_context=prev_context,
+                )
+                delta = self._normalize_delta(delta_raw, chapter_no, default_chunk_id, assets=assets)
+            else:
+                delta = self._normalize_delta(delta, chapter_no, default_chunk_id, assets=assets)
         else:
             if delta is None:
                 if assets is None:
@@ -1089,5 +1426,13 @@ class ChapterProcessor:
         **kwargs,
     ) -> dict[str, Any]:
         """Load an asset file, convert to delta, then process."""
-        delta = load_and_convert(asset_path, chapter_no)
-        return self.process_chapter(book_id, chapter_no, delta=delta, mode="delta", **kwargs)
+        # Load the original assets from file
+        with open(asset_path, 'r', encoding='utf-8') as f:
+            assets = json.load(f)
+
+        # Convert assets to delta format
+        delta = convert_assets_to_delta(assets, chapter_no)
+
+        # Pass both assets and delta to process_chapter
+        # assets are needed for _write_qdrant() to store the 8 asset types
+        return self.process_chapter(book_id, chapter_no, delta=delta, assets=assets, mode="delta", **kwargs)

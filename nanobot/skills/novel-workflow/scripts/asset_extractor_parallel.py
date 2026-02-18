@@ -4,19 +4,41 @@ Uses ThreadPoolExecutor to process multiple chapters simultaneously.
 Recommended: 3-5 workers to balance speed and API rate limits.
 """
 
-import json
-import httpx
-from pathlib import Path
 import argparse
+import asyncio
+import json
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from threading import Lock
 
+import httpx
+from loguru import logger
 
 # Thread-safe counters
 stats_lock = Lock()
 stats = {"processed": 0, "skipped": 0, "failed": 0}
+
+
+def configure_logger(log_file: str | None):
+    """Configure loguru sinks for console and optional file output."""
+    logger.remove()
+    logger.add(
+        lambda msg: print(msg, end=""),
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
+    )
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            str(log_path),
+            level="INFO",
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
+            rotation="50 MB",
+            encoding="utf-8",
+        )
 
 
 def strip_markdown_code_blocks(response: str) -> str:
@@ -116,7 +138,7 @@ def extract_all_assets(chapter_text: str, llm_config: dict) -> dict:
         assets = json.loads(response)
         return assets
     except json.JSONDecodeError as e:
-        print(f"Warning: Failed to parse response: {e}")
+        logger.warning("Failed to parse response JSON: {}", e)
         # Return empty structure
         return {
             "plot_beats": [],
@@ -132,7 +154,7 @@ def extract_all_assets(chapter_text: str, llm_config: dict) -> dict:
 
 def call_llm(prompt: str, llm_config: dict) -> str:
     """Call LLM API (configurable)."""
-    if llm_config["type"] == "custom":
+    if llm_config.get("type") == "custom":
         # Temporarily unset ALL_PROXY to avoid SOCKS proxy issues
         old_all_proxy = os.environ.pop('ALL_PROXY', None)
         old_all_proxy_lower = os.environ.pop('all_proxy', None)
@@ -155,8 +177,55 @@ def call_llm(prompt: str, llm_config: dict) -> str:
                 os.environ['ALL_PROXY'] = old_all_proxy
             if old_all_proxy_lower:
                 os.environ['all_proxy'] = old_all_proxy_lower
-    else:
-        raise ValueError(f"Unsupported LLM type: {llm_config['type']}")
+
+    if llm_config.get("providers") and llm_config.get("model"):
+        provider_cfg = llm_config["providers"].get("anthropic")
+        if not provider_cfg:
+            raise ValueError("providers.anthropic is required in providers mode")
+        api_key = provider_cfg.get("apiKey") or provider_cfg.get("api_key")
+        api_base = provider_cfg.get("apiBase") or provider_cfg.get("api_base")
+        extra_headers = provider_cfg.get("extraHeaders") or provider_cfg.get("extra_headers")
+
+        from nanobot.providers.litellm_provider import LiteLLMProvider
+
+        provider = LiteLLMProvider(
+            api_key=api_key,
+            api_base=api_base,
+            default_model=llm_config["model"],
+            extra_headers=extra_headers,
+        )
+
+        async def _chat_with_timeout():
+            return await asyncio.wait_for(
+                provider.chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=llm_config["model"],
+                    max_tokens=4096,
+                    temperature=0.2,
+                ),
+                timeout=120.0,
+            )
+
+        old_all_proxy = os.environ.pop('ALL_PROXY', None)
+        old_all_proxy_lower = os.environ.pop('all_proxy', None)
+        try:
+            try:
+                asyncio.get_running_loop()
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    response = pool.submit(lambda: asyncio.run(_chat_with_timeout())).result()
+            except RuntimeError:
+                response = asyncio.run(_chat_with_timeout())
+            content = response.content or ""
+            if not content.strip():
+                raise RuntimeError("empty LLM response")
+            return content
+        finally:
+            if old_all_proxy:
+                os.environ['ALL_PROXY'] = old_all_proxy
+            if old_all_proxy_lower:
+                os.environ['all_proxy'] = old_all_proxy_lower
+
+    raise ValueError("Unsupported LLM config: expected {type: custom} or {providers, model}")
 
 
 def process_chapter_file(chapter_file: Path, book_id: str, output_dir: Path,
@@ -209,7 +278,10 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", required=True, help="Output directory for assets")
     parser.add_argument("--llm-config", required=True, help="Path to LLM config JSON")
     parser.add_argument("--workers", type=int, default=3, help="Number of parallel workers (default: 3)")
+    parser.add_argument("--log-file", default="", help="Optional log file path")
     args = parser.parse_args()
+
+    configure_logger(args.log_file or None)
 
     with open(args.llm_config) as f:
         llm_config = json.load(f)
@@ -222,11 +294,11 @@ if __name__ == "__main__":
     chapter_files = sorted(chapter_dir.glob("*.md"))
     total = len(chapter_files)
 
-    print(f"Found {total} chapter files")
-    print(f"Output directory: {output_dir}")
-    print(f"Workers: {args.workers}")
-    print(f"Mode: Parallel (multi-threaded)")
-    print("=" * 60)
+    logger.info("Found {} chapter files", total)
+    logger.info("Output directory: {}", output_dir)
+    logger.info("Workers: {}", args.workers)
+    logger.info("Mode: Parallel (multi-threaded)")
+    logger.info("=" * 60)
 
     start_time = time.time()
     completed = 0
@@ -257,19 +329,30 @@ if __name__ == "__main__":
                 rate = completed / elapsed if elapsed > 0 else 0
                 eta = (total - completed) / rate if rate > 0 else 0
 
-                print(f"\n[{completed}/{total}] {message}")
-                print(f"Progress: {stats['processed']} processed, {stats['skipped']} skipped, {stats['failed']} failed")
-                print(f"Speed: {rate:.2f} chapters/sec | ETA: {eta/60:.1f} min")
+                logger.info("[{}/{}] {}", completed, total, message)
+                logger.info(
+                    "Progress: {} processed, {} skipped, {} failed",
+                    stats["processed"],
+                    stats["skipped"],
+                    stats["failed"],
+                )
+                logger.info("Speed: {:.2f} chapters/sec | ETA: {:.1f} min", rate, eta / 60)
             elif completed % 50 == 0:
                 # Brief update every 50
-                print(f"[{completed}/{total}] Progress: {stats['processed']} processed, {stats['skipped']} skipped")
+                logger.info(
+                    "[{}/{}] Progress: {} processed, {} skipped",
+                    completed,
+                    total,
+                    stats["processed"],
+                    stats["skipped"],
+                )
 
     elapsed = time.time() - start_time
-    print("\n" + "=" * 60)
-    print(f"Extraction complete!")
-    print(f"Processed: {stats['processed']}")
-    print(f"Skipped: {stats['skipped']}")
-    print(f"Failed: {stats['failed']}")
-    print(f"Total time: {elapsed/60:.1f} minutes")
-    print(f"Average speed: {total/elapsed:.2f} chapters/sec")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Extraction complete!")
+    logger.info("Processed: {}", stats["processed"])
+    logger.info("Skipped: {}", stats["skipped"])
+    logger.info("Failed: {}", stats["failed"])
+    logger.info("Total time: {:.1f} minutes", elapsed / 60)
+    logger.info("Average speed: {:.2f} chapters/sec", total / elapsed if elapsed > 0 else 0)
+    logger.info("=" * 60)

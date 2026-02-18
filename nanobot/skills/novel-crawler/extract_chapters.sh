@@ -7,6 +7,7 @@ CHAPTER_LIST="/tmp/all_chapters.txt"
 BASE_URL="${1:-https://www.example.com/book/12345}"
 START_PAGE="${2:-2}"
 END_PAGE="${3:-9}"
+LOG_FILE="${LOG_FILE:-}"
 
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -14,6 +15,11 @@ NC='\033[0m'
 log() {
     echo -e "${GREEN}[$(date '+%H:%M:%S')]${NC} $1"
 }
+
+if [ -n "$LOG_FILE" ]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+    exec > >(tee -a "$LOG_FILE") 2>&1
+fi
 
 log "=========================================="
 log "  提取章节列表"

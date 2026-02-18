@@ -235,6 +235,18 @@ def convert_assets_to_delta(assets: dict, chapter_no: str) -> dict:
         ent.pop("_raw_relationships", None)
         ent.pop("raw_name", None)
 
+    # Preserve the 8 asset types for Qdrant storage
+    # These are needed for semantic search and injection into Book B generation
+    delta["plot_beats"] = assets.get("plot_beats", [])
+    delta["character_cards"] = assets.get("character_cards", [])
+    delta["conflicts"] = assets.get("conflicts", [])
+    delta["settings"] = assets.get("settings", [])
+    delta["themes"] = assets.get("themes", [])
+    # Support both "pov" and "point_of_view" keys
+    delta["pov"] = assets.get("pov", {}) or assets.get("point_of_view", {})
+    delta["tone"] = assets.get("tone", {})
+    delta["style"] = assets.get("style", {})
+
     return delta
 
 

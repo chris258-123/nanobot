@@ -173,20 +173,18 @@ class Neo4jManager:
             """, book_id=book_id, chapter_no=chapter_no, title=title,
                 pov=pov, summary=summary)
 
-    def create_chunks(self, chapter_no: str, chunks: list[dict]) -> None:
+    def create_chunks(self, book_id: str, chapter_no: str, chunks: list[dict]) -> None:
         """Create chunk nodes and link to chapter."""
         with self.driver.session(database=self.database) as session:
             for chunk in chunks:
                 session.run("""
-                    MATCH (c:Chapter {chapter_no: $chapter_no})
-                    MERGE (ck:Chunk {
-                        chunk_id: $chunk_id,
-                        text: $text,
-                        start_pos: $start_pos,
-                        end_pos: $end_pos
-                    })
+                    MATCH (c:Chapter {book_id: $book_id, chapter_no: $chapter_no})
+                    MERGE (ck:Chunk {chunk_id: $chunk_id})
+                    SET ck.text = $text,
+                        ck.start_pos = $start_pos,
+                        ck.end_pos = $end_pos
                     MERGE (c)-[:HAS_CHUNK]->(ck)
-                """, chapter_no=chapter_no, chunk_id=chunk["chunk_id"],
+                """, book_id=book_id, chapter_no=chapter_no, chunk_id=chunk["chunk_id"],
                     text=chunk["text"], start_pos=chunk["start_pos"],
                     end_pos=chunk["end_pos"])
 
@@ -225,7 +223,7 @@ class Neo4jManager:
     # ===== Event Layer =====
 
     def create_event(self, event_id: str, event_type: str, summary: str,
-                    chapter_no: str, participants: list[str],
+                    book_id: str, chapter_no: str, participants: list[str],
                     location_id: Optional[str], commit_id: str) -> None:
         """Create event node with relationships."""
         with self.driver.session(database=self.database) as session:
@@ -242,9 +240,9 @@ class Neo4jManager:
             # Link to chapter
             session.run("""
                 MATCH (ev:Event {event_id: $event_id})
-                MATCH (c:Chapter {chapter_no: $chapter_no})
+                MATCH (c:Chapter {book_id: $book_id, chapter_no: $chapter_no})
                 MERGE (ev)-[:OCCURS_IN]->(c)
-            """, event_id=event_id, chapter_no=chapter_no)
+            """, event_id=event_id, book_id=book_id, chapter_no=chapter_no)
 
             # Link participants
             for participant_id in participants:
@@ -278,7 +276,7 @@ class Neo4jManager:
             """, thread_id=thread_id, name=name, status=status,
                 priority=priority, planned_window=planned_window)
 
-    def create_hook(self, hook_id: str, summary: str, chapter_no: str,
+    def create_hook(self, hook_id: str, summary: str, book_id: str, chapter_no: str,
                    thread_id: str, evidence_chunk_id: Optional[str]) -> None:
         """Create hook and link to thread."""
         with self.driver.session(database=self.database) as session:
@@ -293,11 +291,11 @@ class Neo4jManager:
 
             session.run("""
                 MATCH (h:Hook {hook_id: $hook_id})
-                MATCH (c:Chapter {chapter_no: $chapter_no})
+                MATCH (c:Chapter {book_id: $book_id, chapter_no: $chapter_no})
                 MATCH (t:Thread {thread_id: $thread_id})
                 CREATE (h)-[:OCCURS_IN]->(c)
                 CREATE (h)-[:SETS_UP]->(t)
-            """, hook_id=hook_id, chapter_no=chapter_no, thread_id=thread_id)
+            """, hook_id=hook_id, book_id=book_id, chapter_no=chapter_no, thread_id=thread_id)
 
     # ===== Query Methods =====
 

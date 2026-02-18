@@ -9,14 +9,30 @@
 
 import os
 import re
-import sys
+import argparse
 from pathlib import Path
 from collections import defaultdict
 
-# 支持环境变量或命令行参数
-NOVEL_DIR = os.environ.get('NOVEL_DIR', os.path.expanduser("~/novel_data"))
-if len(sys.argv) > 1:
-    NOVEL_DIR = sys.argv[1]
+from loguru import logger
+
+
+def configure_logger(log_file: str | None):
+    logger.remove()
+    logger.add(
+        lambda msg: print(msg, end=""),
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
+    )
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            str(log_path),
+            level="INFO",
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
+            rotation="20 MB",
+            encoding="utf-8",
+        )
 
 def get_chapter_title(filepath):
     """获取章节标题（文件第一行）"""
@@ -26,7 +42,7 @@ def get_chapter_title(filepath):
             title = first_line.lstrip('#').strip()
             return title
     except Exception as e:
-        print(f"警告: 无法读取 {filepath.name}: {e}")
+        logger.warning("无法读取 {}: {}", filepath.name, e)
         return None
 
 def chinese_to_arabic(chinese_num):
@@ -99,19 +115,32 @@ def clean_title(title):
     return title.strip()
 
 def main():
-    print("=" * 50)
-    print("  整理小说章节文件")
-    print("=" * 50)
+    parser = argparse.ArgumentParser(description="整理小说章节文件（去重/排序/重命名）")
+    parser.add_argument(
+        "novel_dir",
+        nargs="?",
+        default=os.environ.get("NOVEL_DIR", os.path.expanduser("~/novel_data")),
+        help="章节目录路径（默认读取 NOVEL_DIR 或 ~/novel_data）",
+    )
+    parser.add_argument("--log-file", default="", help="可选日志文件路径")
+    args = parser.parse_args()
 
-    novel_path = Path(NOVEL_DIR)
+    configure_logger(args.log_file or None)
+
+    novel_dir = args.novel_dir
+
+    logger.info("=" * 50)
+    logger.info("整理小说章节文件")
+    logger.info("=" * 50)
+
+    novel_path = Path(novel_dir)
     if not novel_path.exists():
-        print(f"错误: 目录不存在 {NOVEL_DIR}")
+        logger.error("目录不存在: {}", novel_dir)
         return
 
     md_files = [f for f in novel_path.glob("*.md")
                 if not f.name.startswith('temp_')]
-    print(f"找到 {len(md_files)} 个文件")
-    print()
+    logger.info("找到 {} 个文件", len(md_files))
 
     # 按章节标题分组（去重）
     title_groups = defaultdict(list)
@@ -141,39 +170,41 @@ def main():
             unique_files.append(keep_file)
 
             for f in files_sorted[1:]:
-                print(f"删除重复标题: {f.name}")
+                logger.info("删除重复标题: {}", f.name)
                 try:
                     f.unlink()
                     duplicates_removed += 1
                 except Exception as e:
-                    print(f"  错误: {e}")
+                    logger.warning("删除失败 {}: {}", f.name, e)
         else:
             unique_files.append(files[0])
 
     # 删除重复章节号的文件
     for chapter_num, files_with_titles in chapter_number_groups.items():
-        if len(files_with_titles) > 1 and chapter_num != 99999:
-            print(f"\n发现重复章节号 {chapter_num}:")
-            for filepath, title in files_with_titles:
-                print(f"  - {filepath.name}: {title}")
+        # Some files may already be removed during title-based dedupe.
+        existing_files_with_titles = [(fp, t) for fp, t in files_with_titles if fp.exists()]
+        if len(existing_files_with_titles) > 1 and chapter_num != 99999:
+            logger.info("发现重复章节号 {}:", chapter_num)
+            for filepath, title in existing_files_with_titles:
+                logger.info("- {}: {}", filepath.name, title)
 
             # 保留文件大小最大的（内容最多的）
-            files_sorted = sorted(files_with_titles, key=lambda x: x[0].stat().st_size, reverse=True)
+            files_sorted = sorted(existing_files_with_titles, key=lambda x: x[0].stat().st_size, reverse=True)
             keep_file = files_sorted[0][0]
-            print(f"  保留: {keep_file.name}")
+            logger.info("保留: {}", keep_file.name)
 
             for filepath, title in files_sorted[1:]:
                 if filepath in unique_files:
                     unique_files.remove(filepath)
-                print(f"  删除: {filepath.name}")
+                logger.info("删除: {}", filepath.name)
                 try:
                     filepath.unlink()
                     duplicates_removed += 1
                 except Exception as e:
-                    print(f"    错误: {e}")
+                    logger.warning("删除失败 {}: {}", filepath.name, e)
 
-    print(f"\n删除了 {duplicates_removed} 个重复文件")
-    print(f"剩余 {len(unique_files)} 个唯一文件")
+    logger.info("删除了 {} 个重复文件", duplicates_removed)
+    logger.info("剩余 {} 个唯一文件", len(unique_files))
 
     # 重新获取文件信息并排序
     files_to_rename = []
@@ -190,12 +221,11 @@ def main():
     main_chapters = sum(1 for x in files_to_rename if not x[0])
     extra_chapters = sum(1 for x in files_to_rename if x[0])
 
-    print(f"\n正文章节: {main_chapters}")
-    print(f"番外章节: {extra_chapters}")
-    print()
+    logger.info("正文章节: {}", main_chapters)
+    logger.info("番外章节: {}", extra_chapters)
 
     # 重命名文件
-    print("开始重命名...")
+    logger.info("开始重命名...")
     renamed_count = 0
 
     for index, (is_extra, chapter_num, title, old_path) in enumerate(files_to_rename, 1):
@@ -215,19 +245,19 @@ def main():
                 renamed_count += 1
 
                 if renamed_count <= 10 or renamed_count == main_chapters or renamed_count == main_chapters + 1:
-                    print(f"  {chapter_num:04d}: {clean_name[:50]}")
+                    logger.info("{:04d}: {}", chapter_num, clean_name[:50])
                 elif renamed_count % 100 == 0:
-                    print(f"  {chapter_num:04d}: {clean_name[:50]}")
+                    logger.info("{:04d}: {}", chapter_num, clean_name[:50])
             except Exception as e:
-                print(f"  错误: 无法重命名 {old_path.name}: {e}")
+                logger.warning("无法重命名 {}: {}", old_path.name, e)
 
-    print(f"\n重命名了 {renamed_count} 个文件")
-    print("\n" + "=" * 50)
-    print("  整理完成")
-    print("=" * 50)
-    print(f"正文章节: 0001 - {main_chapters:04d}")
-    print(f"番外章节: {main_chapters+1:04d} - {len(files_to_rename):04d}")
-    print(f"保存位置: {NOVEL_DIR}")
+    logger.info("重命名了 {} 个文件", renamed_count)
+    logger.info("=" * 50)
+    logger.info("整理完成")
+    logger.info("=" * 50)
+    logger.info("正文章节: 0001 - {:04d}", main_chapters)
+    logger.info("番外章节: {:04d} - {:04d}", main_chapters + 1, len(files_to_rename))
+    logger.info("保存位置: {}", novel_dir)
 
 if __name__ == "__main__":
     main()

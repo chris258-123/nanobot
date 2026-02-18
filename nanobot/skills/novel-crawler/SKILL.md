@@ -6,6 +6,7 @@ description: 小说网站爬取技能。当用户需要从小说网站爬取章�
 # 小说爬虫技能
 
 这个技能用于从小说网站完整爬取小说章节，并自动整理为有序的 Markdown 文件。
+`novel-workflow` 中的爬取/清洗内容已迁移到这里统一维护。
 
 ## 使用场景
 
@@ -14,6 +15,23 @@ description: 小说网站爬取技能。当用户需要从小说网站爬取章�
 - 用户需要整理已爬取的章节文件时
 
 ## 工作流程
+
+推荐直接使用本目录脚本（从仓库根目录执行）：
+
+```bash
+# 1) 提取目录页章节链接（示例：1~13页）
+LOG_FILE="/path/to/logs/extract.log" \
+bash nanobot/skills/novel-crawler/extract_chapters.sh "https://www.22biqu.com/biqu5669" 1 13
+
+# 2) 爬取章节（输出目录可自定义）
+OUTPUT_DIR="/path/to/novel_origin" \
+LOG_FILE="/path/to/logs/crawl.log" \
+bash nanobot/skills/novel-crawler/crawl_novel.sh
+
+# 3) 清洗章节（去重/排序/重命名）
+python3 nanobot/skills/novel-crawler/organize_chapters.py "/path/to/novel_origin" \
+  --log-file "/path/to/logs/cleanup.log"
+```
 
 ### 第一步：提取章节列表
 
@@ -46,7 +64,8 @@ echo "找到 $(wc -l < /tmp/chapters.txt) 个章节"
 
 ```bash
 # 用法: bash extract_chapters.sh <base_url> <start_page> <end_page>
-bash extract_chapters.sh "https://www.22biqu.com/biqu7034" 2 9
+LOG_FILE="$HOME/novel_data/extract.log" \
+bash nanobot/skills/novel-crawler/extract_chapters.sh "https://www.22biqu.com/biqu7034" 2 9
 
 # 查看提取结果
 wc -l /tmp/all_chapters.txt
@@ -61,7 +80,9 @@ wc -l /tmp/all_chapters.txt
 ls -lh /tmp/all_chapters.txt
 
 # 开始爬取
-bash crawl_novel.sh
+OUTPUT_DIR="$HOME/novel_data" \
+LOG_FILE="$HOME/novel_data/crawl.log" \
+bash nanobot/skills/novel-crawler/crawl_novel.sh
 
 # 查看进度
 tmux attach -t novel_crawler
@@ -72,7 +93,7 @@ tmux attach -t novel_crawler
 **脚本特点：**
 - 在 tmux 后台运行，可随时查看进度
 - 自动重命名章节文件（使用章节标题）
-- 失败重试和错误处理
+- 基础错误处理与失败统计
 - 实时进度监控
 
 **核心爬虫：** [`crawl-chapter-playwright.js`](./crawl-chapter-playwright.js)
@@ -88,7 +109,8 @@ tmux attach -t novel_crawler
 
 ```bash
 # 整理章节：去重、排序、重命名
-python3 organize_chapters.py
+python3 nanobot/skills/novel-crawler/organize_chapters.py "$HOME/novel_data" \
+  --log-file "$HOME/novel_data/cleanup.log"
 ```
 
 **整理功能：**
@@ -114,6 +136,7 @@ python3 organize_chapters.py
 | 参数 | 说明 | 默认值 |
 |---|---|---|
 | `OUTPUT_DIR` | 输出目录 | `~/novel_data` |
+| `LOG_FILE` | 日志文件路径 | 空（仅终端） |
 | `TMUX_SESSION` | tmux 会话名 | `novel_crawler` |
 | `sleep` | 请求间隔（秒） | `1` |
 
@@ -126,16 +149,20 @@ python3 organize_chapters.py
 npm install playwright
 
 # 2. 提取章节列表
-bash extract_chapters.sh "https://www.22biqu.com/biqu7034" 2 9
+LOG_FILE="$HOME/novel_data/extract.log" \
+bash nanobot/skills/novel-crawler/extract_chapters.sh "https://www.22biqu.com/biqu7034" 2 9
 
 # 3. 开始爬取
-bash crawl_novel.sh
+OUTPUT_DIR="$HOME/novel_data" \
+LOG_FILE="$HOME/novel_data/crawl.log" \
+bash nanobot/skills/novel-crawler/crawl_novel.sh
 
 # 4. 查看进度
 tmux attach -t novel_crawler
 
 # 5. 等待完成后整理
-python3 organize_chapters.py
+python3 nanobot/skills/novel-crawler/organize_chapters.py "$HOME/novel_data" \
+  --log-file "$HOME/novel_data/cleanup.log"
 ```
 
 ### 单页爬取示例
@@ -148,7 +175,9 @@ agent-browser snapshot | grep -A 2 "link.*第.*章" | grep "url:" | sed 's/.*url
 agent-browser close
 
 # 开始爬取
-bash crawl_novel.sh
+OUTPUT_DIR="$HOME/novel_data" \
+LOG_FILE="$HOME/novel_data/crawl.log" \
+bash nanobot/skills/novel-crawler/crawl_novel.sh
 ```
 
 ## 技能资源
@@ -160,7 +189,7 @@ bash crawl_novel.sh
 - [`organize_chapters.py`](./organize_chapters.py) - 章节整理脚本
 
 ### 输出文件
-- `~/novel_data/*.md` - 爬取的章节文件
+- `OUTPUT_DIR/*.md` - 爬取的章节文件（默认 `~/novel_data`）
 - `/tmp/all_chapters.txt` - 章节链接列表
 - `/tmp/crawl_task.sh` - 临时爬取任务脚本
 
@@ -196,7 +225,7 @@ A:
 
 **Q: 章节顺序混乱怎么办？**
 
-A: 运行整理脚本 `python3 organize_chapters.py`，它会按章节号重新排序
+A: 运行整理脚本 `python3 nanobot/skills/novel-crawler/organize_chapters.py "$HOME/novel_data"`，它会按章节号重新排序
 
 **Q: 如何爬取其他小说网站？**
 
@@ -216,8 +245,8 @@ A:
 **Q: 爬取中断了怎么办？**
 
 A:
-- 脚本会跳过已存在的章节文件
-- 重新运行 `bash crawl_novel.sh` 即可继续爬取
+- 重新运行 `OUTPUT_DIR="$HOME/novel_data" LOG_FILE="$HOME/novel_data/crawl.log" bash nanobot/skills/novel-crawler/crawl_novel.sh`
+- 当前脚本默认会从 `/tmp/all_chapters.txt` 全量重跑；如需断点续爬，请先从列表中删除已完成链接
 - 或手动编辑 `/tmp/all_chapters.txt` 删除已爬取的链接
 
 ## 自定义配置
@@ -227,6 +256,7 @@ A:
 编辑 `crawl_novel.sh`：
 ```bash
 OUTPUT_DIR="/your/custom/path"
+LOG_FILE="/your/custom/path/crawl.log"
 ```
 
 ### 修改选择器
