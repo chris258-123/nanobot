@@ -25,20 +25,21 @@ For crawling and chapter cleanup, use `nanobot/skills/novel-crawler/SKILL.md`.
 - Neo4j-B running on a different URI/instance (example `bolt://localhost:7689`)
 - LLM config file ready (recommended: `/home/chris/Desktop/my_workspace/nanobot/nanobot/skills/novel-workflow/llm_config.json`)
 
-### Connectivity fix for `chinese-large` embedding (important)
+### Connectivity fix for proxy + `chinese-large` embedding (important)
 
-When using `--embedding-model chinese-large` (`BAAI/bge-large-zh-v1.5`), model download/load goes through HuggingFace.
-If your shell has `ALL_PROXY`/`all_proxy` set to `socks://...`, `httpx` may fail with:
+When using `--embedding-model chinese-large` (`BAAI/bge-large-zh-v1.5`) or calling LLM endpoints:
 
-- `ValueError: Unknown scheme for proxy URL URL('socks://...')`
+- `ALL_PROXY`/`all_proxy=socks://...` can break some `httpx` calls (`Unknown scheme for proxy URL`).
+- Clearing `HTTP_PROXY`/`HTTPS_PROXY` may cause slow/no-response LLM calls on networks that require HTTP proxy.
 
-Use this fix before running workflow commands:
+Use this standard fix before running workflow commands:
 
 ```bash
 unset ALL_PROXY all_proxy
 ```
 
-Then run commands normally (keep `HTTP_PROXY`/`HTTPS_PROXY` if you need them), for example:
+Keep `HTTP_PROXY`/`HTTPS_PROXY` if your network requires them.
+For example:
 
 ```bash
 unset ALL_PROXY all_proxy
@@ -47,6 +48,19 @@ python nanobot/skills/novel-workflow/scripts/reprocess_all.py \
   --embedding-model chinese-large \
   ...
 ```
+
+For Book-B generation, use the same proxy rule:
+
+```bash
+unset ALL_PROXY all_proxy
+python nanobot/skills/novel-workflow/scripts/generate_book_ab.py ...
+```
+
+Note: `generate_book_ab.py` is aligned with this rule and only strips `ALL_PROXY/all_proxy` for LLM calls.
+
+Important: `Qdrant 404` and `blueprint/JSON parse failure` are separate issues from proxy setup.
+- `Qdrant 404`: usually wrong collection name / route / service state.
+- `JSON parse failure`: usually model output format drift; use retry/backoff and repair logic.
 
 LLM config example (custom endpoint mode):
 
@@ -173,11 +187,17 @@ python nanobot/skills/novel-workflow/scripts/generate_book_ab.py \
   --output-dir /tmp/novel_b \
   --llm-config /home/chris/Desktop/my_workspace/nanobot/nanobot/skills/novel-workflow/llm_config.json \
   --commit-memory \
-  --consistency-policy warn_only \
+  --consistency-policy strict_blocking \
+  --continuity-mode strict_gate \
+  --continuity-retry 3 \
+  --continuity-window 12 \
+  --continuity-min-entities 3 \
+  --continuity-min-open-threads 1 \
+  --chapter-summary-style structured \
   --enforce-isolation \
   --template-semantic-search \
   --template-semantic-model chinese-large \
-  --reference-top-k 8 \
+  --reference-top-k 12 \
   --llm-max-retries 3 \
   --llm-retry-backoff 3 \
   --llm-backoff-factor 2 \
@@ -207,15 +227,110 @@ Resume generation:
 python nanobot/skills/novel-workflow/scripts/generate_book_ab.py ... --resume
 ```
 
+### Continuity strict-gate (recommended)
+
+`generate_book_ab.py` now supports chapter-to-chapter continuity gating:
+
+- `--continuity-mode strict_gate`: retry chapter generation if continuity checks fail
+- `--continuity-retry`: max retries per chapter in strict mode
+- `--continuity-window`: number of recent chapter capsules injected into prompt
+- `--continuity-min-entities`: minimum carried entities expected in new chapter text
+- `--continuity-min-open-threads`: minimum open-thread progress expected
+- `--chapter-summary-style structured`: use structured continuity capsule instead of plain 1-2 sentence summary
+
+The script also sanitizes model output to remove duplicated heading lines inside body text
+(for example both `# 第三章...` and `第三章...` appearing together).
+
+Blueprint is also gated before chapter writing:
+
+- rejects generic hooks (for example `留下推动下一章的悬念`)
+- requires per-chapter `carry_over_to_next` and (from chapter 2) `open_with`
+- enforces cross-chapter link: chapter N `carry_over_to_next` must be reflected in chapter N+1 `open_with`
+
+The gate report is written to:
+
+- `<log_dir>/generate_book_ab/<target_book_id>_<timestamp>/blueprint_continuity_report.json`
+
+Recommended rollout:
+
+1) Run `0001-0010` first and verify continuity logs/injection files.  
+2) If stable, continue long-run batches (`--resume`) for full chapters.
+
+### Enforce Chinese memory fields for Book B (A-like context style)
+
+`generate_book_ab.py` now supports Chinese enforcement for Book-B memory context and commit path.
+
+Default behavior (already enabled):
+
+- `--enforce-chinese-on-injection`
+- `--enforce-chinese-on-commit`
+- `--enforce-chinese-fields rule,status,trait,goal,secret,state`
+
+Example command (explicit):
+
+```bash
+unset ALL_PROXY all_proxy
+python nanobot/skills/novel-workflow/scripts/generate_book_ab.py \
+  ... \
+  --enforce-chinese-on-injection \
+  --enforce-chinese-on-commit \
+  --enforce-chinese-fields rule,status,trait,goal,secret,state
+```
+
+If you only want strict Chinese for `rule/status`:
+
+```bash
+python nanobot/skills/novel-workflow/scripts/generate_book_ab.py \
+  ... \
+  --enforce-chinese-fields rule,status
+```
+
+### Rebuild Book B from scratch (delete then regenerate)
+
+When old B memory is polluted by mixed language, rebuild B before rerun:
+
+1) Stop running Book-B generation process.
+2) Delete Book-B outputs (`chapter_*.md`, blueprint, run_report, target Canon DB).
+3) Clear Book-B Neo4j target (book-specific data or whole B instance).
+4) Recreate Book-B Qdrant collection.
+5) Re-run generation from chapter `0001` with `--commit-memory`.
+
+### Long-run continuation (6 -> 1200, batch size 100)
+
+Use the batch runner to avoid single long fragile runs:
+
+```bash
+unset ALL_PROXY all_proxy
+python nanobot/skills/novel-workflow/scripts/run_book_b_batches.py \
+  --start-chapter 6 \
+  --end-chapter 1200 \
+  --batch-size 100 \
+  --max-attempts 3
+```
+
+Recommended tmux launch:
+
+```bash
+tmux new-session -d -s b_full_1200 \
+  "unset ALL_PROXY all_proxy; \
+   /home/chris/miniforge3/envs/nanobot/bin/python \
+   /home/chris/Desktop/my_workspace/nanobot/nanobot/skills/novel-workflow/scripts/run_book_b_batches.py \
+   --start-chapter 6 --end-chapter 1200 --batch-size 100 --max-attempts 3 \
+   | tee /home/chris/Desktop/my_workspace/novel_data/04/new_book/log/b_full_1200.launch.log"
+```
+
 ## Isolation Rules (Critical)
 
 For `--commit-memory`, A and B must be physically isolated:
 
 - Canon: different `.db` files
-- Neo4j: different URI/instance (recommended) and/or dedicated database
+- Neo4j: different URI/instance (required for Community Edition)
 - Qdrant: different collections
 
 Do not reuse A targets as B write targets.
+
+For Neo4j **Community Edition** (`neo4j:*-community`), only the default `neo4j` database is available.
+So A/B isolation must use **different Neo4j instances** (different port/container + separate `/data` volume), not just different database names.
 
 ## 4) Visualization & Validation
 
@@ -236,6 +351,144 @@ python nanobot/skills/novel-workflow/scripts/visualize_neo4j.py \
   --book-id novel_b \
   --canon-db-path /tmp/canon_novel_b.db \
   --protagonist-name 主角名
+```
+
+### Live progress checks (safe read-only)
+
+These checks are read-only (`SELECT` / `MATCH ... RETURN` / Qdrant `scroll|count`) and do not reset or modify running ingestion.
+
+1) Tail batch log:
+
+```bash
+tail -n 20 /path/to/reprocess.log
+```
+
+2) Canon progress (chapters done / latest chapter):
+
+```bash
+python -c "import sqlite3; c=sqlite3.connect('/path/to/canon.db'); \
+print('done', c.execute(\"select count(*) from commit_log where book_id=? and commit_type='CHAPTER_PROCESS' and status='ALL_DONE'\",('novel_a',)).fetchone()[0]); \
+print('last', c.execute(\"select max(chapter_no) from commit_log where book_id=?\",('novel_a',)).fetchone()[0]); c.close()"
+```
+
+3) Qdrant 8-asset coverage (per chapter completeness):
+
+```bash
+python - <<'PY'
+import sqlite3, requests, collections
+book='novel_a'; db='/path/to/canon.db'; col='novel_a_assets'; q='http://localhost:6333'
+req=['plot_beat','character_card','conflict','setting','theme','pov','tone','style']
+conn=sqlite3.connect(db)
+chapters=[r[0] for r in conn.execute(
+    "select chapter_no from commit_log where book_id=? and commit_type='CHAPTER_PROCESS' and status='ALL_DONE' order by chapter_no",
+    (book,)
+)]
+conn.close()
+chapter_types=collections.defaultdict(set); counts=collections.Counter(); offset=None
+while True:
+    payload={'limit':1000,'with_payload':True,'with_vector':False,'filter':{'must':[{'key':'book_id','match':{'value':book}}]}}
+    if offset is not None: payload['offset']=offset
+    data=requests.post(f'{q}/collections/{col}/points/scroll',json=payload,timeout=60).json()['result']
+    for p in data.get('points',[]):
+        pl=p.get('payload',{}) or {}
+        ch=str(pl.get('chapter') or pl.get('chapter_no') or '').zfill(4)
+        t=pl.get('asset_type') or pl.get('memory_type') or pl.get('type')
+        if not t: continue
+        counts[t]+=1
+        if ch and t in req: chapter_types[ch].add(t)
+    offset=data.get('next_page_offset')
+    if not offset: break
+missing=[(ch,[t for t in req if t not in chapter_types.get(ch,set())]) for ch in chapters]
+missing=[x for x in missing if x[1]]
+print('qdrant_points',sum(counts.values()))
+print('qdrant_type_counts',{k:counts.get(k,0) for k in req})
+print('chapters_missing_any_8_assets',len(missing))
+print('missing_examples',missing[:20])
+PY
+```
+
+4) Neo4j progress (book-scoped via Canon commit_id filter):
+
+```bash
+/home/chris/miniforge3/envs/nanobot/bin/python - <<'PY'
+import sqlite3
+from neo4j import GraphDatabase
+book='novel_a'; db='/path/to/canon.db'
+conn=sqlite3.connect(db)
+ids=[r[0] for r in conn.execute("select commit_id from commit_log where book_id=? and status='ALL_DONE' order by chapter_no",(book,))]
+conn.close()
+d=GraphDatabase.driver('bolt://localhost:7689',auth=('neo4j','novel123'))
+with d.session(database='neo4j') as s:
+    ch=s.run("MATCH (c:Chapter {book_id: $b}) RETURN count(c) AS n",b=book).single()['n']
+    ev=s.run("MATCH (e:Event)-[:OCCURS_IN]->(:Chapter {book_id: $b}) RETURN count(DISTINCT e) AS n",b=book).single()['n']
+    rel=s.run("MATCH ()-[r:RELATES]->() WHERE r.commit_id IN $ids RETURN count(r) AS n",ids=ids).single()['n']
+print('neo4j_chapters',ch)
+print('neo4j_events',ev)
+print('neo4j_relations_by_commit',rel)
+d.close()
+PY
+```
+
+5) Canon 8-asset completeness (payload assets empty check):
+
+```bash
+python - <<'PY'
+import sqlite3, json
+book='novel_a'; db='/path/to/canon.db'
+conn=sqlite3.connect(db)
+rows=conn.execute("select chapter_no,payload_json from commit_log where book_id=? and commit_type='CHAPTER_PROCESS' and status='ALL_DONE' order by chapter_no",(book,)).fetchall()
+conn.close()
+bad=[]
+for ch,p in rows:
+    d=json.loads(p) if p else {}
+    a=d.get('assets') if isinstance(d,dict) else {}
+    miss=[]
+    if not a.get('plot_beats'): miss.append('plot_beats')
+    if not a.get('character_cards'): miss.append('character_cards')
+    if not a.get('conflicts'): miss.append('conflicts')
+    if not a.get('settings'): miss.append('settings')
+    if not a.get('themes'): miss.append('themes')
+    if not (a.get('pov') or a.get('point_of_view')): miss.append('pov')
+    if not a.get('tone'): miss.append('tone')
+    if not a.get('style'): miss.append('style')
+    if miss: bad.append((ch,miss))
+print('canon_chapters_missing_any_8_assets',len(bad))
+print('missing_examples',bad[:20])
+PY
+```
+
+6) Book-B Chinese-field check (`rule/status/trait/goal/secret/state`):
+
+```bash
+python - <<'PY'
+import sqlite3, json, re
+book='novel_b'; db='/path/to/canon_novel_b.db'
+fields={'rule','status','trait','goal','secret','state'}
+latin=re.compile(r'[A-Za-z]')
+conn=sqlite3.connect(db)
+rows=conn.execute("""
+SELECT fh.chapter_no, fh.predicate, fh.object_json
+FROM fact_history fh
+JOIN commit_log cl ON cl.commit_id=fh.commit_id
+WHERE cl.book_id=?
+""",(book,)).fetchall()
+conn.close()
+bad=[]
+def walk(v, chapter, pred):
+    if isinstance(v,str):
+        if latin.search(v): bad.append((chapter,pred,v[:120]))
+    elif isinstance(v,list):
+        for x in v: walk(x,chapter,pred)
+    elif isinstance(v,dict):
+        for x in v.values(): walk(x,chapter,pred)
+for ch,pred,obj in rows:
+    if (pred or '').lower() not in fields: continue
+    try: val=json.loads(obj or 'null')
+    except Exception: val=obj
+    walk(val,ch,pred)
+print('target_fields_with_english',len(bad))
+print('examples',bad[:20])
+PY
 ```
 
 ## Logs and Outputs

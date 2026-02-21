@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import os
+import random
 import re
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 from canon_db_v2 import CanonDBV2
-from delta_converter import convert_assets_to_delta, load_and_convert
+from delta_converter import convert_assets_to_delta
 from delta_extractor_llm import DeltaExtractorLLM
 from name_normalizer import VALID_RELATION_TYPES, classify_relation_type, normalize_name
 from neo4j_manager import Neo4jManager
@@ -49,6 +54,175 @@ SYMMETRIC_RELATION_KINDS = {
     "RIVAL",
     "ROMANTIC",
 }
+DEFAULT_ENFORCE_CHINESE_FIELDS = ("rule", "status", "trait", "goal", "secret", "state")
+LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
+
+
+def _strip_markdown_code_blocks(content: str) -> str:
+    text = (content or "").strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
+class ChineseValueNormalizer:
+    def __init__(
+        self,
+        llm_config: dict[str, Any] | None,
+        *,
+        max_tokens: int = 512,
+        max_retries: int = 2,
+        retry_backoff: float = 2.0,
+        backoff_factor: float = 2.0,
+        backoff_max: float = 30.0,
+        retry_jitter: float = 0.5,
+    ):
+        self.llm_config = llm_config or {}
+        self.max_tokens = max_tokens
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+        self.backoff_factor = backoff_factor
+        self.backoff_max = backoff_max
+        self.retry_jitter = retry_jitter
+        self._cache: dict[str, str] = {}
+
+    @staticmethod
+    def _needs_translation(text: str) -> bool:
+        cleaned = text.strip()
+        if not cleaned:
+            return False
+        if not LATIN_CHAR_RE.search(cleaned):
+            return False
+        if re.fullmatch(r"[A-Z0-9_:-]{2,}", cleaned):
+            return False
+        if re.fullmatch(r"[a-z]+_[0-9a-f]{6,}", cleaned):
+            return False
+        return True
+
+    @staticmethod
+    def _pop_proxy_env() -> dict[str, str]:
+        backup: dict[str, str] = {}
+        for key in ("ALL_PROXY", "all_proxy"):
+            value = os.environ.pop(key, None)
+            if value is not None:
+                backup[key] = value
+        return backup
+
+    @staticmethod
+    def _restore_proxy_env(backup: dict[str, str]) -> None:
+        for key, value in backup.items():
+            os.environ[key] = value
+
+    def _call_llm(self, prompt: str) -> str:
+        if self.llm_config.get("type") == "custom":
+            proxy_backup = self._pop_proxy_env()
+            try:
+                response = httpx.post(
+                    self.llm_config["url"],
+                    json={
+                        "model": self.llm_config["model"],
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.0,
+                        "max_tokens": self.max_tokens,
+                    },
+                    headers={"Authorization": f"Bearer {self.llm_config['api_key']}"},
+                    timeout=120.0,
+                )
+                response.raise_for_status()
+                return response.json()["choices"][0]["message"]["content"] or ""
+            finally:
+                self._restore_proxy_env(proxy_backup)
+
+        if self.llm_config.get("providers") and self.llm_config.get("model"):
+            provider_cfg = self.llm_config["providers"].get("anthropic")
+            if not provider_cfg:
+                raise ValueError("providers.anthropic is required in providers mode")
+            api_key = provider_cfg.get("apiKey") or provider_cfg.get("api_key")
+            api_base = provider_cfg.get("apiBase") or provider_cfg.get("api_base")
+            extra_headers = provider_cfg.get("extraHeaders") or provider_cfg.get("extra_headers")
+            from nanobot.providers.litellm_provider import LiteLLMProvider
+
+            provider = LiteLLMProvider(
+                api_key=api_key,
+                api_base=api_base,
+                default_model=self.llm_config["model"],
+                extra_headers=extra_headers,
+            )
+
+            async def _chat_with_timeout():
+                return await asyncio.wait_for(
+                    provider.chat(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=self.llm_config["model"],
+                        temperature=0.0,
+                        max_tokens=self.max_tokens,
+                    ),
+                    timeout=120.0,
+                )
+
+            proxy_backup = self._pop_proxy_env()
+            try:
+                try:
+                    asyncio.get_running_loop()
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        response = pool.submit(lambda: asyncio.run(_chat_with_timeout())).result()
+                except RuntimeError:
+                    response = asyncio.run(_chat_with_timeout())
+            finally:
+                self._restore_proxy_env(proxy_backup)
+            return response.content or ""
+
+        raise ValueError("Unsupported llm_config: expected {type: custom} or {providers, model}")
+
+    def translate(self, text: str) -> str:
+        original = str(text or "")
+        if not self._needs_translation(original):
+            return original
+        cached = self._cache.get(original)
+        if cached is not None:
+            return cached
+
+        prompt = (
+            "将下面文本翻译成简体中文，只输出翻译后的文本。\n"
+            "保留专有名词、实体ID、关系枚举和技术缩写原样（例如 character_ab12cd、CO_PARTICIPANT、Neo4j）。\n"
+            "不要解释，不要 markdown。\n\n"
+            f"{original}"
+        )
+        attempts = max(self.max_retries, 0) + 1
+        last_error: Exception | None = None
+        translated = original
+        for attempt in range(1, attempts + 1):
+            try:
+                translated = _strip_markdown_code_blocks(self._call_llm(prompt)).strip() or original
+                break
+            except Exception as exc:  # pragma: no cover - operational retry
+                last_error = exc
+                if attempt >= attempts:
+                    logger.warning("Chinese translation fallback used: %s", exc)
+                    translated = original
+                    break
+                base = self.retry_backoff * (self.backoff_factor ** max(0, attempt - 1))
+                delay = min(base, self.backoff_max)
+                if self.retry_jitter > 0:
+                    delay += random.uniform(0, self.retry_jitter)
+                time.sleep(delay)
+        if last_error and translated == original:
+            logger.debug("Translation kept original text after retries: %s", last_error)
+        self._cache[original] = translated
+        return translated
+
+    def normalize_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self.translate(value)
+        if isinstance(value, list):
+            return [self.normalize_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self.normalize_value(item) for key, item in value.items()}
+        return value
 
 
 class ChapterProcessor:
@@ -72,6 +246,13 @@ class ChapterProcessor:
         embedding_model=None,
         use_flag_model: bool = False,
         vector_size: int = 1024,
+        enforce_chinese_on_commit: bool = False,
+        enforce_chinese_fields: tuple[str, ...] | None = None,
+        chinese_llm_max_retries: int = 2,
+        chinese_retry_backoff: float = 2.0,
+        chinese_backoff_factor: float = 2.0,
+        chinese_backoff_max: float = 30.0,
+        chinese_retry_jitter: float = 0.5,
     ):
         self.neo4j = Neo4jManager(neo4j_uri, neo4j_user, neo4j_pass, neo4j_database)
         self.canon_db = CanonDBV2(canon_db_path)
@@ -87,6 +268,24 @@ class ChapterProcessor:
         self.embedding_model = embedding_model
         self.use_flag_model = use_flag_model
         self.vector_size = vector_size
+        self.enforce_chinese_on_commit = enforce_chinese_on_commit
+        self.enforce_chinese_fields = {
+            str(field).strip().lower()
+            for field in (enforce_chinese_fields or DEFAULT_ENFORCE_CHINESE_FIELDS)
+            if str(field).strip()
+        }
+        self.chinese_normalizer = (
+            ChineseValueNormalizer(
+                llm_config=llm_config or {},
+                max_retries=chinese_llm_max_retries,
+                retry_backoff=chinese_retry_backoff,
+                backoff_factor=chinese_backoff_factor,
+                backoff_max=chinese_backoff_max,
+                retry_jitter=chinese_retry_jitter,
+            )
+            if enforce_chinese_on_commit and llm_config
+            else None
+        )
         self.delta_extractor = (
             DeltaExtractorLLM(llm_config, max_tokens=llm_max_tokens) if llm_config else None
         )
@@ -667,6 +866,20 @@ class ChapterProcessor:
 
         resolved_delta["relations_delta"] = deduped
 
+    def _enforce_chinese_fields_on_delta(self, resolved_delta: dict[str, Any]) -> None:
+        if not self.enforce_chinese_on_commit or not self.chinese_normalizer:
+            return
+        facts = resolved_delta.get("fact_changes", [])
+        if not isinstance(facts, list):
+            return
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            predicate = str(fact.get("predicate") or "").strip().lower()
+            if predicate not in self.enforce_chinese_fields:
+                continue
+            fact["value"] = self.chinese_normalizer.normalize_value(fact.get("value"))
+
     def _extract_assets(self, chapter_text: str) -> dict[str, Any]:
         from asset_extractor_parallel import extract_all_assets
 
@@ -1237,6 +1450,7 @@ class ChapterProcessor:
         resolved_delta, entity_meta = self._resolve_delta_entity_ids(delta, chapter_no)
         self._augment_resolved_relations_from_events(resolved_delta, entity_meta, chapter_no)
         self._prune_relations(resolved_delta)
+        self._enforce_chinese_fields_on_delta(resolved_delta)
         proposed_facts = resolved_delta.get("fact_changes", [])
         proposed_rels = resolved_delta.get("relations_delta", [])
 

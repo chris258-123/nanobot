@@ -90,7 +90,9 @@ PUBLISH_SUCCESS_PAGE_SELECTORS = [
     "div.chapter-table.auto-editor-chapter",
 ]
 
-CHAPTER_TITLE_PATTERN = re.compile(r"^\s*第\s*(\d+)\s*章\s*(.*)$")
+CHAPTER_TITLE_PATTERN = re.compile(
+    r"^\s*第\s*([0-9零〇○一二三四五六七八九十百千万两壹贰叁肆伍陆柒捌玖拾佰仟]+)\s*章(?:\s*[:：\-—_.、，,]?\s*(.*))?$"
+)
 AI_REQUIRED_TEXT = "是否使用AI"
 PUBLISH_CONFIRM_SELECTORS = [
     'button:has-text("确认发布")',
@@ -143,6 +145,31 @@ IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 _PHASE_LOGGED_KEYS: set[str] = set()
+CHINESE_DIGIT_MAP = {
+    "零": 0,
+    "〇": 0,
+    "○": 0,
+    "一": 1,
+    "壹": 1,
+    "二": 2,
+    "两": 2,
+    "贰": 2,
+    "三": 3,
+    "叁": 3,
+    "四": 4,
+    "肆": 4,
+    "五": 5,
+    "伍": 5,
+    "六": 6,
+    "陆": 6,
+    "七": 7,
+    "柒": 7,
+    "八": 8,
+    "捌": 8,
+    "九": 9,
+    "玖": 9,
+}
+CHINESE_UNIT_MAP = {"十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000, "万": 10000}
 
 
 @dataclass(slots=True)
@@ -188,6 +215,48 @@ def parse_bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
+def normalize_chapter_number(raw_value: str) -> str:
+    """Normalize chapter sequence to Arabic digits when possible."""
+    candidate = (raw_value or "").strip()
+    if not candidate:
+        return candidate
+
+    fullwidth_digit_map = str.maketrans("０１２３４５６７８９", "0123456789")
+    ascii_candidate = candidate.translate(fullwidth_digit_map)
+    if ascii_candidate.isdigit():
+        return str(int(ascii_candidate))
+
+    total = 0
+    section = 0
+    number = 0
+    has_chinese_token = False
+
+    for char in candidate:
+        if char in CHINESE_DIGIT_MAP:
+            number = CHINESE_DIGIT_MAP[char]
+            has_chinese_token = True
+            continue
+        if char in CHINESE_UNIT_MAP:
+            unit = CHINESE_UNIT_MAP[char]
+            has_chinese_token = True
+            if unit == 10000:
+                section = (section + number) * unit
+                total += section
+                section = 0
+                number = 0
+            else:
+                if number == 0:
+                    number = 1
+                section += number * unit
+                number = 0
+            continue
+        return candidate
+
+    if not has_chinese_token:
+        return candidate
+    return str(total + section + number)
+
+
 def extract_title(markdown_text: str, fallback_name: str) -> str:
     """Extract the first H1 title, then fallback to file stem."""
     match = H1_PATTERN.search(markdown_text)
@@ -204,8 +273,9 @@ def split_chapter_title(raw_title: str) -> tuple[str | None, str]:
     if not match:
         return None, raw_title.strip()
 
-    chapter_number = match.group(1).strip() or None
-    chapter_name = match.group(2).strip()
+    chapter_number = normalize_chapter_number(match.group(1).strip()) or None
+    chapter_name = (match.group(2) or "").strip()
+    chapter_name = chapter_name.lstrip("：:-—_.、，,").strip()
     if not chapter_name:
         chapter_name = raw_title.strip()
     return chapter_number, chapter_name
