@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import select
 import sys
 import time
 from dataclasses import dataclass
@@ -157,6 +158,11 @@ def log_phase_once(phase_key: str, message: str, *args) -> None:
         return
     _PHASE_LOGGED_KEYS.add(phase_key)
     logger.info(message, *args)
+
+
+def log_debug_exception(context: str, exc: Exception) -> None:
+    """Log lightweight debug exception context without interrupting retries."""
+    logger.debug("{}: {}: {}", context, type(exc).__name__, exc)
 
 
 def configure_logging(log_dir: Path, explicit_log_file: str | None) -> Path:
@@ -418,7 +424,8 @@ def _find_first_visible_selector(
                 )
                 continue
             return selector
-        except Exception:
+        except Exception as exc:
+            log_debug_exception(f"find-visible-selector:{selector}", exc)
             continue
     return None
 
@@ -454,7 +461,8 @@ def _locator_disabled_reason(locator) -> str | None:
         )
         if isinstance(reason, str) and reason.strip():
             return reason.strip()
-    except Exception:
+    except Exception as exc:
+        log_debug_exception("locator-disabled-reason", exc)
         return None
     return None
 
@@ -467,7 +475,8 @@ def _is_locator_actionable(locator, timeout_ms: int = 400) -> bool:
         if locator.get_attribute("disabled") is not None:
             return False
         return _locator_disabled_reason(locator) is None
-    except Exception:
+    except Exception as exc:
+        log_debug_exception("locator-actionable-check", exc)
         return False
 
 
@@ -514,7 +523,8 @@ def handle_blocking_overlays(page) -> bool:
                 break
             if handled:
                 break
-        except Exception:
+        except Exception as exc:
+            log_debug_exception(f"overlay-risk-modal:{hint}", exc)
             continue
 
     for modal_selector in CONTINUE_EDIT_MODAL_SELECTORS:
@@ -536,7 +546,8 @@ def handle_blocking_overlays(page) -> bool:
                 break
             if handled:
                 break
-        except Exception:
+        except Exception as exc:
+            log_debug_exception(f"overlay-continue-edit:{modal_selector}", exc)
             continue
 
     for _ in range(6):
@@ -555,7 +566,8 @@ def handle_blocking_overlays(page) -> bool:
                 logger.info("Dismissed tour overlay via '{}'", button_selector)
                 clicked = True
                 break
-            except Exception:
+            except Exception as exc:
+                log_debug_exception(f"overlay-tour:{button_selector}", exc)
                 continue
         if not clicked:
             break
@@ -576,7 +588,8 @@ def handle_blocking_overlays(page) -> bool:
         handled = handled or tour_removed
         if tour_removed:
             logger.info("Removed #___reactour overlay directly")
-    except Exception:
+    except Exception as exc:
+        log_debug_exception("overlay-remove-reactour", exc)
         pass
 
     return handled
@@ -635,7 +648,8 @@ def describe_selector_candidates(page, selector: str) -> list[dict[str, str]]:
             selector,
         )
         return [{k: str(v) for k, v in row.items()} for row in rows]
-    except Exception:
+    except Exception as exc:
+        log_debug_exception("describe-selector-candidates", exc)
         return []
 
 
@@ -665,7 +679,8 @@ def collect_ui_hints(page) -> list[str]:
             """
         )
         return [str(item) for item in hints]
-    except Exception:
+    except Exception as exc:
+        log_debug_exception("collect-ui-hints", exc)
         return []
 
 
@@ -679,7 +694,8 @@ def is_publish_stage_ready(page) -> bool:
         try:
             if modal.count() > 0 and modal.is_visible(timeout=300):
                 return True
-        except Exception:
+        except Exception as exc:
+            log_debug_exception(f"publish-stage-modal:{selector}", exc)
             continue
 
     for hint in TYPO_MODAL_HINTS + RISK_MODAL_HINTS:
@@ -689,7 +705,8 @@ def is_publish_stage_ready(page) -> bool:
         try:
             if modal.count() > 0 and modal.is_visible(timeout=300):
                 return True
-        except Exception:
+        except Exception as exc:
+            log_debug_exception(f"publish-stage-hint:{hint}", exc)
             continue
     return False
 
@@ -714,7 +731,8 @@ def has_visible_modal_dialog(page) -> bool:
                 """
             )
         )
-    except Exception:
+    except Exception as exc:
+        log_debug_exception("has-visible-modal-dialog", exc)
         return False
 
 
@@ -758,7 +776,8 @@ def safe_click(page, locator, description: str, timeout_ms: int = 3000) -> bool:
                         timeout=800,
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                log_debug_exception("safe-click:target-in-modal-check", exc)
                 pass
             if has_visible_modal_dialog(page) and not target_in_modal:
                 logger.warning(
@@ -817,7 +836,8 @@ def is_publish_success_state(page) -> bool:
         if "/chapter-manage/" in page.url:
             logger.info("Detected publish success URL '{}'", page.url)
             return True
-    except Exception:
+    except Exception as exc:
+        log_debug_exception("publish-success:url-check", exc)
         pass
 
     for selector in PUBLISH_SUCCESS_PAGE_SELECTORS:
@@ -826,7 +846,8 @@ def is_publish_success_state(page) -> bool:
             if locator.count() > 0 and locator.is_visible(timeout=500):
                 logger.info("Detected publish success page via selector '{}'", selector)
                 return True
-        except Exception:
+        except Exception as exc:
+            log_debug_exception(f"publish-success:selector:{selector}", exc)
             continue
     return False
 
@@ -839,9 +860,11 @@ def context_has_success_page(page) -> bool:
                 if "/chapter-manage/" in ctx_page.url:
                     logger.info("Detected success in sibling page url='{}'", ctx_page.url)
                     return True
-            except Exception:
+            except Exception as exc:
+                log_debug_exception("context-success:sibling-url", exc)
                 continue
-    except Exception:
+    except Exception as exc:
+        log_debug_exception("context-success:iterate-pages", exc)
         return False
     return False
 
@@ -889,7 +912,8 @@ def fill_input_exact(page, selectors: list[str], value: str, field_name: str) ->
 
             try:
                 locator.click(timeout=1500)
-            except Exception:
+            except Exception as exc:
+                log_debug_exception(f"fill-input:pre-click:{selector}", exc)
                 pass
             locator.fill(value, timeout=2000)
             actual = locator.input_value(timeout=2000).strip()
@@ -1119,7 +1143,8 @@ def click_save_draft_once(page, wait_seconds: int = 8) -> bool:
                 if toast.count() > 0 and toast.is_visible(timeout=300):
                     logger.info("Detected draft-save hint '{}'", hint)
                     return True
-            except Exception:
+            except Exception as exc:
+                log_debug_exception(f"save-draft:toast:{hint}", exc)
                 continue
         page.wait_for_timeout(250)
 
@@ -1147,7 +1172,8 @@ def handle_typo_modal_submit(page) -> bool:
                 page.wait_for_timeout(350)
                 logger.info("Dismissed typo modal via '{}'", button_selector)
                 return True
-        except Exception:
+        except Exception as exc:
+            log_debug_exception(f"typo-modal:{hint}", exc)
             continue
     return False
 
@@ -1243,7 +1269,8 @@ def is_ai_option_selected(modal, ai_option: str) -> bool:
                 ai_option,
             )
         )
-    except Exception:
+    except Exception as exc:
+        log_debug_exception("ai-option-selected", exc)
         return False
 
 
@@ -1288,7 +1315,8 @@ def force_select_ai_option(modal, ai_option: str) -> bool:
                 ai_option,
             )
         )
-    except Exception:
+    except Exception as exc:
+        log_debug_exception("ai-option-force-select", exc)
         return False
 
 
@@ -1301,7 +1329,8 @@ def handle_publish_modal(page, ai_generated: bool) -> bool:
             if candidate.count() > 0 and candidate.is_visible(timeout=800):
                 modal = candidate
                 break
-        except Exception:
+        except Exception as exc:
+            log_debug_exception(f"publish-modal:probe:{selector}", exc)
             continue
     if modal is None:
         return False
@@ -1353,7 +1382,8 @@ def handle_publish_modal(page, ai_generated: bool) -> bool:
                 ai_clicked = True
                 logger.info("Clicked AI option via selector '{}'", selector)
                 break
-        except Exception:
+        except Exception as exc:
+            log_debug_exception(f"publish-modal:ai-option:{selector}", exc)
             continue
 
     if not ai_clicked:
@@ -1388,7 +1418,8 @@ def handle_publish_modal(page, ai_generated: bool) -> bool:
                         return True
                     raise
                 return True
-        except Exception:
+        except Exception as exc:
+            log_debug_exception(f"publish-modal:confirm:{selector}", exc)
             continue
 
     if is_publish_success_state(page):
@@ -1423,9 +1454,11 @@ def run_publish(
     editor_wait_seconds: int,
     publish_wait_seconds: int,
     hard_timeout_seconds: int,
+    manual_wait_seconds: int,
     log_dir: Path,
 ) -> None:
     """Open browser, wait for login/editor, fill fields, and optionally publish."""
+    _PHASE_LOGGED_KEYS.clear()
     sync_playwright = _load_playwright()
     profile_dir.mkdir(parents=True, exist_ok=True)
     logger.info(
@@ -1589,9 +1622,7 @@ def run_publish(
                 print("Headless mode + --publish=false: close now because manual review is impossible.")
                 return
 
-            print("Please review the editor and click Publish manually.")
-            print("Press Enter here after publishing to close browser.")
-            input()
+            wait_for_manual_review_exit(manual_wait_seconds)
         except Exception as exc:
             logger.exception("Publish flow failed: {}", exc)
             try:
@@ -1612,7 +1643,8 @@ def run_publish(
         finally:
             try:
                 context.close()
-            except Exception:
+            except Exception as exc:
+                log_debug_exception("context-close", exc)
                 pass
 
 
@@ -1627,6 +1659,46 @@ def preview_payload(payload: ChapterPayload) -> None:
     if len(payload.body) > len(body_preview):
         print("...")
     print("-" * 40)
+
+
+def wait_for_manual_review_exit(manual_wait_seconds: int) -> None:
+    """Wait for manual confirmation without hanging in non-interactive environments."""
+    print("Please review the editor and click Publish manually.")
+    if not sys.stdin.isatty():
+        logger.warning("STDIN is not a TTY. Skip manual wait to avoid hanging.")
+        print("Non-interactive stdin detected. Closing now.")
+        return
+
+    if manual_wait_seconds > 0:
+        logger.info("Waiting for manual confirmation up to {}s", manual_wait_seconds)
+        print(f"Press Enter to close now, or wait {manual_wait_seconds}s to auto-close.")
+        deadline = time.time() + manual_wait_seconds
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                logger.info("Manual wait timed out after {}s", manual_wait_seconds)
+                print(f"Timed out after {manual_wait_seconds}s, closing now.")
+                return
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], min(1.0, remaining))
+            except Exception as exc:
+                log_debug_exception("manual-wait:select", exc)
+                time.sleep(min(1.0, remaining))
+                continue
+            if ready:
+                try:
+                    sys.stdin.readline()
+                except Exception as exc:
+                    log_debug_exception("manual-wait:readline", exc)
+                logger.info("Manual confirmation received via stdin")
+                return
+
+    print("Press Enter here after publishing to close browser.")
+    try:
+        input()
+        logger.info("Manual confirmation received via blocking input")
+    except EOFError:
+        logger.warning("EOF on stdin while waiting for manual confirmation; closing.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1699,6 +1771,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hard timeout for whole browser flow; on timeout browser is auto-closed",
     )
     parser.add_argument(
+        "--manual-wait-seconds",
+        type=int,
+        default=0,
+        help="Only for --publish=false: wait up to N seconds for manual Enter; 0 means unlimited in TTY",
+    )
+    parser.add_argument(
         "--log-dir",
         default=str(DEFAULT_LOG_DIR),
         help="Path for debug screenshots/html on failure",
@@ -1717,14 +1795,17 @@ def main() -> int:
     log_dir = Path(args.log_dir).expanduser().resolve()
     trace_log = configure_logging(log_dir, args.trace_log_file or None)
     logger.info("Trace log file: {}", trace_log)
+    if args.manual_wait_seconds < 0:
+        parser.error("--manual-wait-seconds must be >= 0")
     logger.info(
-        "CLI args: md_path='{}' work_url='{}' publish={} headless={} ai_generated={} hard_timeout_seconds={}",
+        "CLI args: md_path='{}' work_url='{}' publish={} headless={} ai_generated={} hard_timeout_seconds={} manual_wait_seconds={}",
         args.md_path,
         args.work_url,
         args.publish,
         args.headless,
         args.ai_generated,
         args.hard_timeout_seconds,
+        args.manual_wait_seconds,
     )
 
     md_path = Path(args.md_path).expanduser().resolve()
@@ -1752,6 +1833,7 @@ def main() -> int:
             editor_wait_seconds=args.editor_wait_seconds,
             publish_wait_seconds=args.publish_wait_seconds,
             hard_timeout_seconds=args.hard_timeout_seconds,
+            manual_wait_seconds=args.manual_wait_seconds,
             log_dir=log_dir,
         )
     except Exception as exc:

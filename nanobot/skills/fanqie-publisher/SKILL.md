@@ -56,7 +56,8 @@ Fill editor, then publish manually:
 python nanobot/skills/fanqie-publisher/scripts/publish_fanqie.py \
   --md-path /path/to/chapter.md \
   --work-url "https://fanqienovel.com/writer/..." \
-  --publish false
+  --publish false \
+  --manual-wait-seconds 120
 ```
 
 Automatic publish click:
@@ -71,11 +72,13 @@ python nanobot/skills/fanqie-publisher/scripts/publish_fanqie.py \
 
 `--ai-generated` defaults to `true` (自动选“是”). Pass `--ai-generated false` if needed.
 `--hard-timeout-seconds` defaults to `420`; browser flow auto-stops and closes when timeout is reached.
+`--manual-wait-seconds` defaults to `0`; with `--publish=false` it limits manual wait time in TTY mode.
 
 ## Notes
 
 - First run can require manual login and verification in browser.
 - Browser session is persisted under `~/.nanobot/fanqie_profile`.
+- In `--publish=false` mode, if stdin is non-interactive (not a TTY), script exits instead of hanging on `input()`.
 - After `存草稿`, if Fanqie clears fields asynchronously, script auto-refills and waits for stable state before `下一步`.
 - If a modal blocks pointer events, script avoids force-clicking behind the modal and waits for modal handling.
 - Publish settings modal has two debug phases in trace logs:
