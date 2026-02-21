@@ -12,6 +12,7 @@ Publish one Markdown document to a Fanqie chapter editor page.
 
 1. Parse `.md` into a chapter payload
    - chapter title: first H1 (`# ...`), fallback to file name
+   - recommended H1 format: `# 第19章：章节名` (chapter number should be Arabic digits)
    - body: markdown converted to plain text while keeping headings/paragraphs/tables/code blocks readable
 2. Open Fanqie chapter edit URL with persistent browser profile
 3. Wait for manual login on first run
@@ -56,21 +57,26 @@ Fill editor, then publish manually:
 python nanobot/skills/fanqie-publisher/scripts/publish_fanqie.py \
   --md-path /path/to/chapter.md \
   --work-url "https://fanqienovel.com/writer/..." \
+  --headless false \
   --publish false \
   --manual-wait-seconds 120
 ```
 
-Automatic publish click:
+Automatic publish click (recommended):
 
 ```bash
 python nanobot/skills/fanqie-publisher/scripts/publish_fanqie.py \
   --md-path /path/to/chapter.md \
-  --work-url "https://fanqienovel.com/writer/..." \
+  --work-url "https://fanqienovel.com/main/writer/<author_id>/publish/?enter_from=newchapter" \
+  --headless false \
   --publish true \
-  --hard-timeout-seconds 420
+  --ai-generated true \
+  --publish-wait-seconds 120 \
+  --hard-timeout-seconds 600
 ```
 
 `--ai-generated` defaults to `true` (自动选“是”). Pass `--ai-generated false` if needed.
+`--publish-wait-seconds` defaults to `25`; increase it (for example `120`) when publish dialogs are slow.
 `--hard-timeout-seconds` defaults to `420`; browser flow auto-stops and closes when timeout is reached.
 `--manual-wait-seconds` defaults to `0`; with `--publish=false` it limits manual wait time in TTY mode.
 
@@ -78,13 +84,16 @@ python nanobot/skills/fanqie-publisher/scripts/publish_fanqie.py \
 
 - First run can require manual login and verification in browser.
 - Browser session is persisted under `~/.nanobot/fanqie_profile`.
+- Use writer `newchapter` URL for new chapter publishing: `.../publish/?enter_from=newchapter`.
+- If you accidentally pass `.../publish/<chapter_id>?enter_from=newchapter`, script auto-normalizes to `.../publish/?enter_from=newchapter`.
+- Do not refresh manually during publish flow.
 - In `--publish=false` mode, if stdin is non-interactive (not a TTY), script exits instead of hanging on `input()`.
 - After `存草稿`, if Fanqie clears fields asynchronously, script auto-refills and waits for stable state before `下一步`.
+- If `下一步` stays unavailable, check chapter number format first (must be Arabic digits in chapter-number input).
 - If a modal blocks pointer events, script avoids force-clicking behind the modal and waits for modal handling.
 - Publish settings modal has two debug phases in trace logs:
   - `Publish modal visible (phase 1)` = modal is visible
   - `Publish modal interactive (phase 2)` = controls are actionable and script starts AI/confirm clicks
-- If `--work-url` is copied as `/publish/<chapter_id>?enter_from=newchapter`, script will normalize it to `/publish/?enter_from=newchapter` to avoid editing an old chapter by mistake.
 - On selector failure, screenshot and HTML debug artifacts are saved under `~/.nanobot/fanqie_logs`.
 - If Fanqie page structure changes, update selectors by following
   `nanobot/skills/fanqie-publisher/references/fanqie_selectors.md`.
