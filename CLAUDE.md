@@ -147,7 +147,7 @@ docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
 **Skills** (`nanobot/skills/`)
 - Markdown-based skill system (YAML frontmatter + instructions)
 - Loaded dynamically into agent context
-- Built-in skills: github, weather, summarize, tmux, cron, skill-creator, zhipu-search, novel-crawler, novel-workflow, Auto-Redbook-Skills (Xiaohongshu/小红书 content generation)
+- Built-in skills: github, weather, summarize, tmux, cron, skill-creator, zhipu-search, novel-crawler, novel-workflow, Auto-Redbook-Skills (Xiaohongshu/小红书 content generation), vimax-bridge (convert novel chapters to anime short videos via ViMax pipeline)
 - Skills can reference external scripts and assets
 
 **Context Builder** (`nanobot/agent/context.py`)
@@ -307,6 +307,14 @@ The novel workflow system provides comprehensive support for novel writing with 
    - Manages entities (Character, Location, Item, Concept)
    - Tracks relationships with validity periods
    - Supports events, clues, and narrative structure
+
+8. **Continuity Checker** (`nanobot/skills/novel-workflow/scripts/check_continuity_boundaries_v4.py`)
+   - Validates chapter boundary continuity (carry_over / open_with consistency)
+   - Run standalone: `python check_continuity_boundaries_v4.py <canon_db.sqlite>`
+
+9. **Batch Processing Scripts** (`nanobot/skills/novel-workflow/sh/`)
+   - Shell scripts for large-scale chapter processing (e.g., `b_full_1350_v4_batch10.sh`)
+   - `monitor_b_full_1350_v4.sh` for live progress monitoring during batch runs
 
 **Setup:**
 

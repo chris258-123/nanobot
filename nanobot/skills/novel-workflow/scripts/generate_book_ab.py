@@ -75,6 +75,11 @@ PROMPT_METADATA_LABELS: dict[str, str] = {
 DEFAULT_ENFORCE_CHINESE_FIELDS: tuple[str, ...] = ("rule", "status", "trait", "goal", "secret", "state")
 LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
 BLUEPRINT_TEMPLATE_SOURCES: set[str] = {"none", "booka"}
+BLUEPRINT_MODES: set[str] = {"flat", "hierarchical"}
+ENDING_STYLES: set[str] = {"closure", "soft", "hook"}
+DEFAULT_CONTINUITY_MAX_OPENING_OVERLAP = 0.72
+OPENING_REFERENCE_REWRITE_MAX_ATTEMPTS = 2
+OPENING_REFERENCE_MIN_ANCHOR_HITS = 1
 
 
 def _is_empty_value(value: Any) -> bool:
@@ -276,6 +281,102 @@ def _sanitize_text_list(value: Any, *, max_items: int, max_len: int) -> list[str
     return cleaned
 
 
+ANCHOR_PAIR_CHARS: tuple[tuple[str, str], ...] = (
+    ("“", "”"),
+    ("‘", "’"),
+    ("（", "）"),
+    ("【", "】"),
+    ("《", "》"),
+    ("「", "」"),
+    ("『", "』"),
+)
+
+
+def _close_unbalanced_pairs(text: str) -> str:
+    value = str(text or "")
+    for left, right in ANCHOR_PAIR_CHARS:
+        diff = value.count(left) - value.count(right)
+        if diff > 0:
+            value += right * min(diff, 3)
+    return value
+
+
+def _truncate_text_on_sentence_boundary(text: str, *, max_len: int) -> tuple[str, bool]:
+    value = str(text or "").strip()
+    if not value:
+        return ("", False)
+    if len(value) <= max_len:
+        return (value, False)
+    cut = value[: max(int(max_len), 1)].rstrip()
+    min_boundary = max(24, int(max_len * 0.45))
+    pivot = -1
+    for punct in "。！？!?；;":
+        idx = cut.rfind(punct)
+        if idx >= min_boundary:
+            pivot = max(pivot, idx)
+    if pivot < 0:
+        for punct in "，,、":
+            idx = cut.rfind(punct)
+            if idx >= min_boundary:
+                pivot = max(pivot, idx)
+    if pivot >= 0:
+        return (cut[: pivot + 1].rstrip(), True)
+    return (cut, True)
+
+
+def _build_tail_anchor_excerpt(
+    chapter_text: str,
+    *,
+    min_chars: int = 80,
+    max_chars: int = 260,
+) -> tuple[str, bool]:
+    compact = re.sub(r"\s+", " ", str(chapter_text or "").strip())
+    if not compact:
+        return ("", False)
+    segments = [seg.strip() for seg in re.split(r"(?<=[。！？!?])\s+", compact) if seg.strip()]
+    merged = ""
+    if segments:
+        picked: list[str] = []
+        total = 0
+        for seg in reversed(segments):
+            picked.insert(0, seg)
+            total += len(seg)
+            if total >= min_chars and len(picked) >= 2:
+                break
+        merged = "".join(picked).strip()
+    if not merged:
+        merged = compact
+    merged, was_truncated = _truncate_text_on_sentence_boundary(merged, max_len=max_chars)
+    merged = _close_unbalanced_pairs(merged.strip())
+    return (merged, was_truncated)
+
+
+def _sanitize_cross_batch_anchor_items(
+    values: list[str],
+    *,
+    max_items: int = 3,
+    max_len: int = 320,
+) -> tuple[list[str], bool]:
+    cleaned: list[str] = []
+    truncated = False
+    seen: set[str] = set()
+    for item in values:
+        text = re.sub(r"\s+", " ", str(item or "").strip())
+        if not text:
+            continue
+        text, was_truncated = _truncate_text_on_sentence_boundary(text, max_len=max_len)
+        text = _close_unbalanced_pairs(text.strip())
+        if was_truncated:
+            truncated = True
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+        if len(cleaned) >= max_items:
+            break
+    return (cleaned, truncated)
+
+
 GENERIC_HOOK_PHRASES: tuple[str, ...] = (
     "留下推动下一章的悬念",
     "留下悬念",
@@ -300,6 +401,25 @@ LINK_WORD_STOPWORDS: set[str] = {
     "继续",
     "需要",
     "问题",
+}
+
+REFERENCE_ENTITY_STOPWORDS: set[str] = {
+    *LINK_WORD_STOPWORDS,
+    "章节",
+    "开头",
+    "结尾",
+    "开篇",
+    "承接",
+    "剧情",
+    "镜头",
+    "场景",
+    "状态",
+    "目标",
+    "冲突",
+    "线索",
+    "广播",
+    "旋律",
+    "计划",
 }
 
 
@@ -338,6 +458,51 @@ def _char_ngrams(text: str, size: int = 2) -> set[str]:
     return {"".join(chars[idx : idx + size]) for idx in range(len(chars) - size + 1)}
 
 
+def _opening_overlap_ratio(left: str, right: str) -> float:
+    left_bigrams = _char_ngrams(left, size=2)
+    right_bigrams = _char_ngrams(right, size=2)
+    if not left_bigrams or not right_bigrams:
+        return 0.0
+    union = left_bigrams | right_bigrams
+    if not union:
+        return 0.0
+    return len(left_bigrams & right_bigrams) / len(union)
+
+
+def _extract_opening_excerpt(text: str, *, max_chars: int = 420) -> str:
+    compact = str(text or "").strip()
+    if not compact:
+        return ""
+    return compact[: max(int(max_chars), 80)]
+
+
+def _split_chapter_opening_window(
+    text: str,
+    *,
+    max_chars: int = 820,
+    min_chars: int = 180,
+) -> tuple[str, str]:
+    compact = str(text or "").strip()
+    if not compact:
+        return "", ""
+    min_chars = max(int(min_chars or 0), 80)
+    limit = min(max(int(max_chars or 0), min_chars), len(compact))
+    split_idx = limit
+    best = -1
+    for marker in ("\n\n", "\n", "。", "！", "？", ".", "!", "?"):
+        idx = compact.rfind(marker, min_chars, limit)
+        if idx < 0:
+            continue
+        candidate = idx + len(marker)
+        if candidate > best:
+            best = candidate
+    if best >= min_chars:
+        split_idx = best
+    opening = compact[:split_idx].strip()
+    remainder = compact[split_idx:].lstrip()
+    return opening, remainder
+
+
 def _link_items_match(left: str, right: str) -> bool:
     l_norm = _normalize_for_link_match(left)
     r_norm = _normalize_for_link_match(right)
@@ -358,7 +523,12 @@ def _link_items_match(left: str, right: str) -> bool:
     return len(left_bigrams & right_bigrams) >= 2
 
 
-def _validate_blueprint_continuity(chapters: list[dict[str, Any]]) -> dict[str, Any]:
+def _validate_blueprint_continuity(
+    chapters: list[dict[str, Any]],
+    *,
+    start_chapter: int = 1,
+    ending_style: str = "closure",
+) -> dict[str, Any]:
     issues: list[str] = []
     pairs: list[dict[str, Any]] = []
     generic_hook_count = 0
@@ -378,18 +548,25 @@ def _validate_blueprint_continuity(chapters: list[dict[str, Any]]) -> dict[str, 
             }
         )
 
+    style = str(ending_style or "closure").strip().lower()
+    if style not in ENDING_STYLES:
+        style = "closure"
+    hook_required = style == "hook"
+
     for idx, chapter in enumerate(normalized):
         chapter_no = chapter["chapter_no"] or f"{idx + 1:04d}"
         beats = chapter["beat_outline"]
         ending_hook = chapter["ending_hook"]
         if _is_generic_ending_hook(ending_hook):
             generic_hook_count += 1
-            issues.append(f"章节 {chapter_no} ending_hook 过于通用或为空")
+            if hook_required:
+                issues.append(f"章节 {chapter_no} ending_hook 过于通用或为空")
+        requires_open_with = idx > 0 or int(start_chapter or 1) > 1
         if idx < len(normalized) - 1 and not chapter["carry_over_to_next"]:
             issues.append(f"章节 {chapter_no} 缺少 carry_over_to_next")
-        if idx > 0 and not chapter["open_with"]:
+        if requires_open_with and not chapter["open_with"]:
             issues.append(f"章节 {chapter_no} 缺少 open_with")
-        if idx > 0 and chapter["open_with"] and beats:
+        if requires_open_with and chapter["open_with"] and beats:
             first_beat = str(beats[0]).strip()
             if first_beat and not any(_link_items_match(first_beat, item) for item in chapter["open_with"]):
                 issues.append(f"章节 {chapter_no} 第一拍未与 open_with 对齐")
@@ -460,6 +637,43 @@ def _auto_patch_blueprint_links(chapters: list[dict[str, Any]]) -> tuple[list[di
     return patched, patched_count
 
 
+def _build_opening_anchor_sentence(open_with_item: str) -> str:
+    text = str(open_with_item or "").strip()
+    if not text:
+        return "承接上章，局势未止。"
+    text = text.strip("。！？!?,，；;：:")
+    if not text:
+        return "承接上章，局势未止。"
+    if text.startswith("承接上章"):
+        return text if text.endswith(("。", "！", "？")) else f"{text}。"
+    return f"承接上章：{text}。"
+
+
+def _auto_patch_opening_beats(
+    chapters: list[dict[str, Any]],
+    *,
+    start_chapter: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Inject a soft opening anchor beat when beat[0] does not reflect open_with."""
+    patched: list[dict[str, Any]] = copy.deepcopy(chapters)
+    patched_count = 0
+    for idx, chapter in enumerate(patched):
+        requires_open_with = idx > 0 or int(start_chapter or 1) > 1
+        open_with = _normalize_link_items(chapter.get("open_with"))
+        if not requires_open_with or not open_with:
+            continue
+        beats = _sanitize_text_list(chapter.get("beat_outline"), max_items=8, max_len=120)
+        first_beat = str(beats[0]).strip() if beats else ""
+        if first_beat and any(_link_items_match(first_beat, item) for item in open_with):
+            chapter["beat_outline"] = beats
+            continue
+        anchor = _build_opening_anchor_sentence(open_with[0])
+        updated = [anchor] + beats if beats else [anchor]
+        chapter["beat_outline"] = _sanitize_text_list(updated, max_items=8, max_len=120)
+        patched_count += 1
+    return patched, patched_count
+
+
 def _extract_keywords(text: str) -> list[str]:
     tokens = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{2,}", str(text or ""))
     seen: set[str] = set()
@@ -470,6 +684,180 @@ def _extract_keywords(text: str) -> list[str]:
         seen.add(token)
         result.append(token)
     return result
+
+
+def _extract_reference_entities(text: str) -> list[str]:
+    tokens = re.findall(r"[\u4e00-\u9fff]{2,}", str(text or ""))
+    entities: list[str] = []
+    seen: set[str] = set()
+    weak_chars = set("的一了在是和就都而及与着将把被让给对向从到于并其该这那每各先后上中下里外内前后再已仍")
+    for block in tokens:
+        block = block.strip()
+        for size in (2, 3):
+            if len(block) < size:
+                continue
+            for idx in range(len(block) - size + 1):
+                token = block[idx : idx + size]
+                if token in seen:
+                    continue
+                seen.add(token)
+                if token in REFERENCE_ENTITY_STOPWORDS:
+                    continue
+                if token.endswith(("章节", "问题", "状态", "线索", "剧情", "事件", "计划", "镜头")):
+                    continue
+                if token[0] in weak_chars or token[-1] in weak_chars:
+                    continue
+                entities.append(token)
+    return entities
+
+
+def _count_entity_pronouns(text: str, entity: str) -> dict[str, int]:
+    if not entity:
+        return {"他": 0, "她": 0, "TA": 0}
+    counters = {"他": 0, "她": 0, "TA": 0}
+    pattern = re.compile(
+        rf"{re.escape(entity)}[^。！？\n]{{0,12}}([他她])|([他她])[^。！？\n]{{0,12}}{re.escape(entity)}|"
+        rf"{re.escape(entity)}[^。！？\n]{{0,12}}(?:TA|ta)|(?:TA|ta)[^。！？\n]{{0,12}}{re.escape(entity)}"
+    )
+    for match in pattern.finditer(str(text or "")):
+        token = ""
+        if match.group(1):
+            token = match.group(1)
+        elif match.group(2):
+            token = match.group(2)
+        else:
+            token = "TA"
+        if token in {"他", "她", "TA"}:
+            counters[token] += 1
+    return counters
+
+
+def _detect_narrative_pov(text: str) -> str:
+    content = str(text or "")
+    first_hits = len(re.findall(r"(?:我|我们|咱们)", content))
+    third_hits = len(re.findall(r"(?:他|她|他们|她们|TA|ta)", content))
+    if first_hits >= 3 and first_hits >= int(third_hits * 1.2):
+        return "first_person"
+    if third_hits >= 3 and third_hits >= int(first_hits * 1.2):
+        return "third_person"
+    return "mixed"
+
+
+def _build_opening_reference_profile(
+    *,
+    previous_chapter_carry_over: list[str],
+    current_chapter_open_with: list[str],
+    previous_chapter_opening_text: str,
+    chapter_opening_text: str,
+    recent_continuity_capsules: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    source_chunks: list[str] = []
+    source_chunks.extend(_normalize_link_items(previous_chapter_carry_over, max_items=4, max_len=180))
+    source_chunks.extend(_normalize_link_items(current_chapter_open_with, max_items=4, max_len=180))
+    if previous_chapter_opening_text:
+        source_chunks.append(_extract_opening_excerpt(previous_chapter_opening_text, max_chars=560))
+    if chapter_opening_text:
+        source_chunks.append(_extract_opening_excerpt(chapter_opening_text, max_chars=560))
+
+    entity_scores: dict[str, int] = {}
+    entity_first_pos: dict[str, int] = {}
+    for idx, chunk in enumerate(source_chunks):
+        for token in _extract_reference_entities(chunk):
+            entity_scores[token] = entity_scores.get(token, 0) + 1
+            entity_first_pos.setdefault(token, idx)
+
+    if recent_continuity_capsules:
+        for capsule in recent_continuity_capsules[-3:]:
+            for name in _sanitize_text_list(capsule.get("carry_entities"), max_items=8, max_len=32):
+                if len(name) < 2:
+                    continue
+                entity_scores[name] = entity_scores.get(name, 0) + 1
+                entity_first_pos.setdefault(name, len(source_chunks))
+
+    anchor_entities = sorted(
+        entity_scores.keys(),
+        key=lambda item: (-entity_scores.get(item, 0), entity_first_pos.get(item, 10**6), len(item)),
+    )[:6]
+
+    context_text = "\n".join(source_chunks)
+    entity_pronoun_hint: dict[str, str] = {}
+    for entity in anchor_entities:
+        counters = _count_entity_pronouns(context_text, entity)
+        if counters["他"] >= 2 and counters["他"] > counters["她"]:
+            entity_pronoun_hint[entity] = "他"
+        elif counters["她"] >= 2 and counters["她"] > counters["他"]:
+            entity_pronoun_hint[entity] = "她"
+        elif counters["TA"] >= 2:
+            entity_pronoun_hint[entity] = "TA"
+
+    pov_hint = _detect_narrative_pov(context_text)
+    return {
+        "anchor_entities": anchor_entities,
+        "entity_pronoun_hint": entity_pronoun_hint,
+        "pov_hint": pov_hint,
+        "min_anchor_hits": OPENING_REFERENCE_MIN_ANCHOR_HITS,
+    }
+
+
+def _validate_opening_reference_consistency(
+    *,
+    chapter_text: str,
+    reference_profile: dict[str, Any] | None,
+    opening_max_chars: int = 900,
+    min_anchor_hits: int = OPENING_REFERENCE_MIN_ANCHOR_HITS,
+) -> dict[str, Any]:
+    profile = reference_profile if isinstance(reference_profile, dict) else {}
+    opening_text = _extract_opening_excerpt(chapter_text, max_chars=max(260, int(opening_max_chars or 0)))
+    anchor_entities = [
+        str(item).strip()
+        for item in (profile.get("anchor_entities") or [])
+        if str(item).strip()
+    ]
+    pronoun_hints = {
+        str(name).strip(): str(hint).strip()
+        for name, hint in (profile.get("entity_pronoun_hint") or {}).items()
+        if str(name).strip() and str(hint).strip()
+    }
+    expected_pov = str(profile.get("pov_hint") or "").strip()
+
+    issues: list[str] = []
+    hit_entities = [name for name in anchor_entities if name in opening_text]
+    required_hits = max(int(min_anchor_hits or 0), 0)
+    if anchor_entities and len(hit_entities) < required_hits:
+        issues.append(
+            f"章节开头主语锚点不足：要求至少 {required_hits} 个，实际 {len(hit_entities)} 个"
+        )
+
+    pronoun_drifts: list[str] = []
+    for entity, expected in pronoun_hints.items():
+        if entity not in opening_text or expected not in {"他", "她"}:
+            continue
+        counters = _count_entity_pronouns(opening_text, entity)
+        if expected == "他" and counters["她"] > counters["他"] and counters["她"] >= 1:
+            pronoun_drifts.append(f"{entity}(期望他, 检测她={counters['她']})")
+        if expected == "她" and counters["他"] > counters["她"] and counters["他"] >= 1:
+            pronoun_drifts.append(f"{entity}(期望她, 检测他={counters['他']})")
+    if pronoun_drifts:
+        issues.append("章节开头指代漂移：" + "；".join(pronoun_drifts[:4]))
+
+    opening_pov = _detect_narrative_pov(opening_text)
+    if expected_pov in {"first_person", "third_person"} and opening_pov in {"first_person", "third_person"}:
+        if expected_pov != opening_pov:
+            issues.append(
+                f"章节开头叙述视角偏移：期望 {expected_pov}，实际 {opening_pov}"
+            )
+
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "metrics": {
+            "anchor_expected": len(anchor_entities),
+            "anchor_hits": len(hit_entities),
+            "anchor_hit_entities": hit_entities[:6],
+            "pov_expected": expected_pov,
+            "pov_detected": opening_pov,
+        },
+    }
 
 
 def _collect_prev_entities_from_hard_pack(hard_pack: dict[str, Any]) -> list[str]:
@@ -591,14 +979,25 @@ def _validate_chapter_continuity(
     recent_capsules: list[dict[str, Any]],
     hard_pack_b: dict[str, Any],
     open_with_expected: list[str] | None,
+    required_carry_over: list[str] | None = None,
+    previous_chapter_opening_text: str | None = None,
+    max_opening_overlap: float = DEFAULT_CONTINUITY_MAX_OPENING_OVERLAP,
     first_beat_expected: str | None = None,
     continuity_window: int,
     min_entities: int,
     min_open_threads: int,
+    min_chapter_chars: int = 2600,
 ) -> dict[str, Any]:
     text = str(chapter_text or "")
     issues: list[str] = []
     metrics: dict[str, Any] = {}
+
+    body_chars = len(text)
+    required_chars = max(int(min_chapter_chars or 0), 0)
+    metrics["chapter_body_chars"] = body_chars
+    metrics["chapter_chars_min_required"] = required_chars
+    if required_chars > 0 and body_chars < required_chars:
+        issues.append(f"章节正文过短：要求至少 {required_chars} 字，实际 {body_chars} 字")
 
     zh_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
     latin_chars = len(re.findall(r"[A-Za-z]", text))
@@ -651,6 +1050,29 @@ def _validate_chapter_continuity(
     if expected_open_with and opening_hits < 1:
         issues.append("章节开头未承接 open_with 要点")
 
+    carry_over_items = _normalize_link_items(required_carry_over)
+    carry_hits = 0
+    for item in carry_over_items:
+        if _link_items_match(item, opening_text):
+            carry_hits += 1
+    metrics["carry_over_expected"] = len(carry_over_items)
+    metrics["carry_over_opening_hits"] = carry_hits
+    if carry_over_items and carry_hits < 1:
+        issues.append("章节开头未承接上一章 carry_over 要点")
+
+    previous_opening = _extract_opening_excerpt(previous_chapter_opening_text or "", max_chars=len(opening_text))
+    opening_overlap = _opening_overlap_ratio(previous_opening, opening_text) if previous_opening else 0.0
+    overlap_threshold = min(max(float(max_opening_overlap or 0.0), 0.0), 0.99)
+    metrics["opening_overlap_ratio"] = round(opening_overlap, 6)
+    metrics["opening_overlap_threshold"] = overlap_threshold
+    if previous_opening:
+        prev_chars = len(re.findall(r"[\u4e00-\u9fff]", previous_opening))
+        curr_chars = len(re.findall(r"[\u4e00-\u9fff]", opening_text))
+        metrics["previous_opening_zh_chars"] = prev_chars
+        metrics["current_opening_zh_chars"] = curr_chars
+        if prev_chars >= 60 and curr_chars >= 60 and opening_overlap >= overlap_threshold:
+            issues.append(f"章节开篇疑似复写上一章（开头重叠度 {opening_overlap:.2f}）")
+
     first_beat = str(first_beat_expected or "").strip()
     first_beat_hit = 0
     if first_beat:
@@ -670,6 +1092,33 @@ def _validate_chapter_continuity(
         "issues": issues,
         "metrics": metrics,
     }
+
+
+def _issues_need_opening_rewrite(issues: list[str] | None) -> bool:
+    if not issues:
+        return False
+    markers = (
+        "章节开头未承接",
+        "章节开篇未落地",
+        "章节开篇疑似复写",
+        "章节开头主语锚点不足",
+        "章节开头指代漂移",
+        "章节开头叙述视角偏移",
+        "开头未承接",
+        "开篇未落地",
+        "开篇疑似复写",
+        "主语锚点",
+        "指代漂移",
+        "叙述视角",
+        "open_with",
+        "carry_over",
+        "beat_outline[0]",
+    )
+    for issue in issues:
+        text = str(issue or "")
+        if any(marker in text for marker in markers):
+            return True
+    return False
 
 
 def _ensure_hard_context_shape(hard_pack: Any) -> dict[str, Any]:
@@ -732,6 +1181,40 @@ def _parse_json_object(content: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("Expected JSON object")
     return parsed
+
+
+def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _is_delta_json_parse_error(exc: BaseException) -> bool:
+    for item in _iter_exception_chain(exc):
+        if isinstance(item, json.JSONDecodeError):
+            return True
+        if item.__class__.__name__ == "DeltaParseError":
+            return True
+        message = str(item)
+        if "Expecting ',' delimiter" in message:
+            return True
+        if "Failed to parse delta JSON" in message:
+            return True
+    return False
+
+
+def _classify_runtime_error(exc: BaseException) -> str:
+    if _is_delta_json_parse_error(exc):
+        return "DELTA_JSON_PARSE_FAILED"
+    text = " | ".join(str(item) for item in _iter_exception_chain(exc))
+    if "Server disconnected" in text:
+        return "LLM_SERVER_DISCONNECTED"
+    return "RUNTIME_ERROR"
 
 
 def _format_duration(seconds: float) -> str:
@@ -922,13 +1405,20 @@ def _build_diverse_title_seed(chapter: dict[str, Any], chapter_index: int, prev_
     return seed.strip("：:，,。；;、-—_ ")[:22]
 
 
-def _diversify_adjacent_titles(chapters: list[dict[str, Any]]) -> list[dict[str, str]]:
+def _diversify_adjacent_titles(
+    chapters: list[dict[str, Any]],
+    *,
+    previous_title: str = "",
+) -> list[dict[str, str]]:
     alerts: list[dict[str, str]] = []
-    for idx in range(1, len(chapters)):
-        prev_title = str(chapters[idx - 1].get("title") or "")
-        current = chapters[idx]
+    prev_title = str(previous_title or "")
+    for idx, current in enumerate(chapters):
         current_title = str(current.get("title") or "")
+        if idx == 0 and not prev_title:
+            prev_title = current_title
+            continue
         if not _titles_too_similar(prev_title, current_title):
+            prev_title = current_title
             continue
         chapter_no = str(current.get("chapter_no") or f"{idx + 1:04d}")
         chapter_int = int(chapter_no) if chapter_no.isdigit() else idx + 1
@@ -942,16 +1432,23 @@ def _diversify_adjacent_titles(chapters: list[dict[str, Any]]) -> list[dict[str,
             }
         )
         current["title"] = replacement
+        prev_title = replacement
     return alerts
 
 
-def _compute_title_style_metrics(chapters: list[dict[str, Any]]) -> dict[str, Any]:
+def _compute_title_style_metrics(
+    chapters: list[dict[str, Any]],
+    *,
+    previous_title: str = "",
+) -> dict[str, Any]:
     pattern_distribution: dict[str, int] = {}
     adjacent_dup_count = 0
     titles = [str(chapter.get("title") or "") for chapter in chapters if isinstance(chapter, dict)]
     for title in titles:
         key = _title_pattern_key(title)
         pattern_distribution[key] = int(pattern_distribution.get(key, 0)) + 1
+    if previous_title and titles and _titles_too_similar(previous_title, titles[0]):
+        adjacent_dup_count += 1
     for idx in range(1, len(titles)):
         if _titles_too_similar(titles[idx - 1], titles[idx]):
             adjacent_dup_count += 1
@@ -961,8 +1458,18 @@ def _compute_title_style_metrics(chapters: list[dict[str, Any]]) -> dict[str, An
     }
 
 
-def _normalize_chapter_plan(raw_chapters: list[dict[str, Any]], chapter_count: int, start_chapter: int) -> list[dict[str, Any]]:
+def _normalize_chapter_plan(
+    raw_chapters: list[dict[str, Any]],
+    chapter_count: int,
+    start_chapter: int,
+    *,
+    ending_style: str = "closure",
+) -> list[dict[str, Any]]:
     chapters: list[dict[str, Any]] = []
+    style = str(ending_style or "closure").strip().lower()
+    if style not in ENDING_STYLES:
+        style = "closure"
+    hook_required = style == "hook"
     for idx in range(chapter_count):
         chapter_no = start_chapter + idx
         source = raw_chapters[idx] if idx < len(raw_chapters) and isinstance(raw_chapters[idx], dict) else {}
@@ -973,15 +1480,17 @@ def _normalize_chapter_plan(raw_chapters: list[dict[str, Any]], chapter_count: i
         conflict = str(source.get("conflict") or source.get("key_conflict") or "角色目标与外部阻力发生碰撞")
         title = _format_chapter_title(chapter_no, str(source.get("title") or ""), goal)
         ending_hook_raw = str(source.get("ending_hook") or "").strip()
-        ending_hook = ending_hook_raw or "【待修复】请给出具体跨章钩子"
+        ending_hook = ending_hook_raw
+        if hook_required and not ending_hook:
+            ending_hook = "【待修复】请给出具体跨章钩子"
         carry_over_to_next = _normalize_link_items(source.get("carry_over_to_next"))
         open_with = _normalize_link_items(source.get("open_with"))
         needs_repair = False
-        if _is_generic_ending_hook(ending_hook):
+        if hook_required and _is_generic_ending_hook(ending_hook):
             needs_repair = True
         if idx < chapter_count - 1 and not carry_over_to_next:
             needs_repair = True
-        if idx > 0 and not open_with:
+        if (idx > 0 or int(start_chapter or 1) > 1) and not open_with:
             needs_repair = True
         chapters.append(
             {
@@ -1044,6 +1553,108 @@ class InjectionLogger:
         if raw_payload is not None:
             raw_path = self.write(self.raw_rel_path(rel_path), raw_payload)
         return clean_path, raw_path
+
+
+def _stage_bounds_for_chapter(chapter_no: int, stage_size: int) -> tuple[int, int]:
+    safe_stage_size = max(int(stage_size or 1), 1)
+    chapter_int = max(int(chapter_no or 1), 1)
+    stage_start = ((chapter_int - 1) // safe_stage_size) * safe_stage_size + 1
+    stage_end = stage_start + safe_stage_size - 1
+    return stage_start, stage_end
+
+
+def _stage_id(stage_start: int, stage_end: int) -> str:
+    return f"{int(stage_start):04d}_{int(stage_end):04d}"
+
+
+@dataclass
+class BlueprintStore:
+    root_dir: Path
+    target_book_id: str
+    stage_size: int
+    freeze_published: bool
+
+    def __post_init__(self) -> None:
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        self.master_path = self.root_dir / "master_arc.json"
+        self.index_path = self.root_dir / "index.json"
+        self.stage_dir = self.root_dir / "stages"
+        self.batch_dir = self.root_dir / "batches"
+        self.stage_dir.mkdir(parents=True, exist_ok=True)
+        self.batch_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _read_json(path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _write_json(path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load_index(self) -> dict[str, Any]:
+        data = self._read_json(self.index_path) or {}
+        if not data:
+            data = {
+                "target_book_id": self.target_book_id,
+                "blueprint_mode": "hierarchical",
+                "stage_size": int(self.stage_size),
+                "freeze_published_blueprint": bool(self.freeze_published),
+                "locked_until": 0,
+                "book_total_chapters": 0,
+                "updated_at": datetime.now().isoformat(),
+                "stages": [],
+                "batches": [],
+            }
+        data.setdefault("target_book_id", self.target_book_id)
+        data.setdefault("blueprint_mode", "hierarchical")
+        data.setdefault("stage_size", int(self.stage_size))
+        data.setdefault("freeze_published_blueprint", bool(self.freeze_published))
+        data.setdefault("locked_until", 0)
+        data.setdefault("book_total_chapters", 0)
+        data.setdefault("updated_at", datetime.now().isoformat())
+        data.setdefault("stages", [])
+        data.setdefault("batches", [])
+        return data
+
+    def save_index(self, index_payload: dict[str, Any]) -> None:
+        payload = dict(index_payload)
+        payload["updated_at"] = datetime.now().isoformat()
+        self._write_json(self.index_path, payload)
+
+    def load_master_arc(self) -> dict[str, Any] | None:
+        return self._read_json(self.master_path)
+
+    def save_master_arc(self, payload: dict[str, Any]) -> None:
+        self._write_json(self.master_path, payload)
+
+    def stage_path(self, stage_start: int, stage_end: int) -> Path:
+        return self.stage_dir / f"stage_{_stage_id(stage_start, stage_end)}.json"
+
+    def batch_path(self, batch_start: int, batch_end: int) -> Path:
+        return self.batch_dir / f"batch_{int(batch_start):04d}_{int(batch_end):04d}.json"
+
+    def load_stage(self, stage_start: int, stage_end: int) -> dict[str, Any] | None:
+        return self._read_json(self.stage_path(stage_start, stage_end))
+
+    def save_stage(self, stage_start: int, stage_end: int, payload: dict[str, Any]) -> Path:
+        path = self.stage_path(stage_start, stage_end)
+        self._write_json(path, payload)
+        return path
+
+    def load_batch(self, batch_start: int, batch_end: int) -> dict[str, Any] | None:
+        return self._read_json(self.batch_path(batch_start, batch_end))
+
+    def save_batch(self, batch_start: int, batch_end: int, payload: dict[str, Any]) -> Path:
+        path = self.batch_path(batch_start, batch_end)
+        self._write_json(path, payload)
+        return path
 
 
 @dataclass
@@ -2216,24 +2827,361 @@ def _load_all_done_chapters(canon_db_path: str, book_id: str) -> set[str]:
 
 
 def _load_run_report_summaries(output_dir: Path, target_book_id: str) -> dict[str, str]:
+    summaries, _ = _load_run_report_context(output_dir, target_book_id)
+    return summaries
+
+
+def _normalize_chapter_no(chapter_no: Any) -> str:
+    text = str(chapter_no or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"(\d+)", text)
+    if not match:
+        return text
+    return match.group(1).zfill(4)
+
+
+def _parse_resume_overwrite_range(raw: str) -> set[str]:
+    values = str(raw or "").strip()
+    if not values:
+        return set()
+
+    chapters: set[str] = set()
+    for token in values.split(","):
+        part = token.strip()
+        if not part:
+            continue
+        if "-" in part:
+            left_raw, right_raw = [item.strip() for item in part.split("-", 1)]
+            if not left_raw.isdigit() or not right_raw.isdigit():
+                raise ValueError(f"Invalid range token in --resume-overwrite-range: {part}")
+            left = int(left_raw)
+            right = int(right_raw)
+            if left <= 0 or right <= 0:
+                raise ValueError(f"Invalid chapter range in --resume-overwrite-range: {part}")
+            start = min(left, right)
+            end = max(left, right)
+            for chapter_int in range(start, end + 1):
+                chapters.add(f"{chapter_int:04d}")
+            continue
+        if not part.isdigit():
+            raise ValueError(f"Invalid chapter token in --resume-overwrite-range: {part}")
+        chapter_int = int(part)
+        if chapter_int <= 0:
+            raise ValueError(f"Invalid chapter token in --resume-overwrite-range: {part}")
+        chapters.add(f"{chapter_int:04d}")
+    return chapters
+
+
+def _extract_chapter_title_and_text(chapter_markdown: str, fallback_title: str = "") -> tuple[str, str]:
+    text = str(chapter_markdown or "")
+    lines = text.splitlines()
+    if lines:
+        first_line = lines[0].strip()
+        if first_line.startswith("#"):
+            title = first_line.lstrip("#").strip() or str(fallback_title or "").strip()
+            chapter_text = "\n".join(lines[1:]).strip()
+            return title, chapter_text
+    return str(fallback_title or "").strip(), text.strip()
+
+
+def _read_chapter_opening_excerpt(chapter_path: Path, fallback_title: str = "") -> str:
+    if not chapter_path.exists():
+        return ""
+    try:
+        markdown = chapter_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    _, chapter_text = _extract_chapter_title_and_text(markdown, fallback_title=fallback_title)
+    return _extract_opening_excerpt(chapter_text)
+
+
+def _load_previous_chapter_title(*, output_dir: Path, target_book_id: str, chapter_no: int) -> str:
+    prev_no = int(chapter_no or 0) - 1
+    if prev_no <= 0:
+        return ""
+    chapter_path = output_dir / f"{target_book_id}_chapter_{prev_no:04d}.md"
+    if not chapter_path.exists():
+        return ""
+    try:
+        markdown = chapter_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    title, _ = _extract_chapter_title_and_text(markdown, fallback_title="")
+    return str(title or "").strip()
+
+
+def _load_run_report_context(output_dir: Path, target_book_id: str) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
     report_path = output_dir / f"{target_book_id}_run_report.json"
     if not report_path.exists():
-        return {}
+        return ({}, {})
     try:
         data = json.loads(report_path.read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        return ({}, {})
     items = data.get("items", [])
     summary_map: dict[str, str] = {}
+    continuity_capsule_map: dict[str, dict[str, Any]] = {}
     if isinstance(items, list):
         for item in items:
             if not isinstance(item, dict):
                 continue
-            chapter_no = str(item.get("chapter_no") or "").strip()
+            chapter_no = _normalize_chapter_no(item.get("chapter_no"))
             summary = str(item.get("summary") or "").strip()
             if chapter_no and summary:
                 summary_map[chapter_no] = summary
-    return summary_map
+            raw_capsule = item.get("continuity_capsule")
+            if isinstance(raw_capsule, dict):
+                sanitized = _sanitize_continuity_capsules_for_prompt([raw_capsule], window=1)
+                if sanitized:
+                    capsule = sanitized[0]
+                    capsule_chapter_no = _normalize_chapter_no(capsule.get("chapter_no")) or chapter_no
+                    if capsule_chapter_no:
+                        continuity_capsule_map[capsule_chapter_no] = capsule
+    return summary_map, continuity_capsule_map
+
+
+def _preload_recent_continuity_capsules(
+    *,
+    output_dir: Path,
+    target_book_id: str,
+    start_chapter: int,
+    continuity_window: int,
+    blueprint_chapters: list[dict[str, Any]],
+    summary_map: dict[str, str],
+    run_report_capsules: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    window = max(int(continuity_window or 0), 1)
+    history_end = max(int(start_chapter or 1) - 1, 0)
+    history_start = max(1, history_end - window + 1)
+    preload_meta = {
+        "history_start": history_start if history_end > 0 else None,
+        "history_end": history_end if history_end > 0 else None,
+        "from_run_report": 0,
+        "from_chapter_files": 0,
+        "preloaded_count": 0,
+    }
+    if history_end <= 0:
+        return ([], preload_meta)
+
+    chapter_plan_map: dict[str, dict[str, Any]] = {}
+    for chapter in blueprint_chapters:
+        if not isinstance(chapter, dict):
+            continue
+        chapter_no = _normalize_chapter_no(chapter.get("chapter_no"))
+        if chapter_no:
+            chapter_plan_map[chapter_no] = chapter
+
+    capsule_by_chapter: dict[str, dict[str, Any]] = {}
+
+    for chapter_no, capsule in run_report_capsules.items():
+        normalized_no = _normalize_chapter_no(chapter_no)
+        if not normalized_no.isdigit():
+            continue
+        chapter_int = int(normalized_no)
+        if chapter_int < history_start or chapter_int > history_end:
+            continue
+        sanitized = _sanitize_continuity_capsules_for_prompt([capsule], window=1)
+        if sanitized:
+            capsule_by_chapter[normalized_no] = sanitized[0]
+    preload_meta["from_run_report"] = len(capsule_by_chapter)
+
+    for chapter_int in range(history_start, history_end + 1):
+        chapter_no = f"{chapter_int:04d}"
+        if chapter_no in capsule_by_chapter:
+            continue
+        chapter_path = output_dir / f"{target_book_id}_chapter_{chapter_no}.md"
+        if not chapter_path.exists():
+            continue
+        chapter_markdown = chapter_path.read_text(encoding="utf-8")
+        fallback_title = str((chapter_plan_map.get(chapter_no) or {}).get("title") or "").strip()
+        chapter_title, chapter_text = _extract_chapter_title_and_text(chapter_markdown, fallback_title=fallback_title)
+        compact_text = chapter_text.replace("\n", " ").strip()
+        chapter_summary = summary_map.get(chapter_no) or (compact_text[:220] if compact_text else chapter_title)
+        capsule_by_chapter[chapter_no] = _build_fallback_continuity_capsule(
+            chapter_no=chapter_no,
+            chapter_title=chapter_title or fallback_title or chapter_no,
+            chapter_plan=chapter_plan_map.get(chapter_no) or {},
+            chapter_text=chapter_text,
+            chapter_summary=chapter_summary,
+            hard_pack_b={},
+        )
+        preload_meta["from_chapter_files"] += 1
+
+    sorted_chapters = sorted(
+        (int(chapter_no), chapter_no)
+        for chapter_no in capsule_by_chapter
+        if chapter_no.isdigit()
+    )
+    selected = [capsule_by_chapter[chapter_no] for _, chapter_no in sorted_chapters][-window:]
+    preloaded = _sanitize_continuity_capsules_for_prompt(selected, window=window)
+    preload_meta["preloaded_count"] = len(preloaded)
+    return preloaded, preload_meta
+
+
+def _resolve_locked_until_from_files(
+    *,
+    output_dir: Path,
+    target_book_id: str,
+    initial_locked_until: int,
+    scan_limit: int | None = None,
+) -> int:
+    locked = max(int(initial_locked_until or 0), 0)
+    upper = max(int(scan_limit or 0), 0)
+    while True:
+        nxt = locked + 1
+        if upper and nxt > upper:
+            break
+        chapter_path = output_dir / f"{target_book_id}_chapter_{nxt:04d}.md"
+        if not chapter_path.exists():
+            break
+        locked = nxt
+    return locked
+
+
+def _extract_anchor_from_capsule(capsule: dict[str, Any] | None) -> list[str]:
+    if not isinstance(capsule, dict):
+        return []
+    anchor: list[str] = []
+    anchor.extend(_sanitize_text_list(capsule.get("next_chapter_must_answer"), max_items=3, max_len=240))
+    anchor.extend(_sanitize_text_list(capsule.get("open_threads"), max_items=3, max_len=240))
+    normalized, _ = _sanitize_cross_batch_anchor_items(anchor, max_items=3, max_len=320)
+    return normalized
+
+
+def _load_cross_batch_anchor(
+    *,
+    output_dir: Path,
+    target_book_id: str,
+    start_chapter: int,
+    run_report_capsules: dict[str, dict[str, Any]],
+) -> tuple[list[str], str, dict[str, Any]]:
+    meta: dict[str, Any] = {
+        "raw": [],
+        "normalized": [],
+        "truncated": False,
+    }
+    prev_no = max(int(start_chapter or 1) - 1, 0)
+    if prev_no <= 0:
+        return ([], "book_start", meta)
+    prev_key = f"{prev_no:04d}"
+    from_report = _extract_anchor_from_capsule(run_report_capsules.get(prev_key))
+    if from_report:
+        normalized, truncated = _sanitize_cross_batch_anchor_items(from_report, max_items=3, max_len=320)
+        meta = {
+            "raw": from_report,
+            "normalized": normalized,
+            "truncated": truncated,
+        }
+        return (normalized, "run_report_capsule", meta)
+    chapter_path = output_dir / f"{target_book_id}_chapter_{prev_key}.md"
+    if chapter_path.exists():
+        text = chapter_path.read_text(encoding="utf-8")
+        title, chapter_text = _extract_chapter_title_and_text(text, fallback_title=prev_key)
+        tail_excerpt, tail_truncated = _build_tail_anchor_excerpt(chapter_text, min_chars=80, max_chars=260)
+        if tail_excerpt:
+            raw_anchor = [f"{title}结尾承接：{tail_excerpt}"]
+            normalized, normalized_truncated = _sanitize_cross_batch_anchor_items(
+                raw_anchor, max_items=1, max_len=320
+            )
+            if normalized:
+                meta = {
+                    "raw": raw_anchor,
+                    "normalized": normalized,
+                    "truncated": bool(tail_truncated or normalized_truncated),
+                }
+                return (normalized, "chapter_file_tail", meta)
+    return ([], "none", meta)
+
+
+def _derive_link_items_from_recent_capsule(capsule: dict[str, Any] | None) -> list[str]:
+    if not isinstance(capsule, dict):
+        return []
+    candidates: list[str] = []
+    candidates.extend(_sanitize_text_list(capsule.get("next_chapter_must_answer"), max_items=6, max_len=120))
+    candidates.extend(_sanitize_text_list(capsule.get("open_threads"), max_items=6, max_len=120))
+    candidates.extend(_sanitize_text_list(capsule.get("state_deltas"), max_items=4, max_len=120))
+    return _sanitize_text_list(candidates, max_items=3, max_len=120)
+
+
+def _resolve_chapter_linkage(
+    *,
+    chapter_no: str,
+    idx: int,
+    start_chapter: int,
+    chapter_plan: dict[str, Any],
+    prev_chapter_plan: dict[str, Any],
+    recent_continuity_capsules: list[dict[str, Any]],
+    hard_pack_b: dict[str, Any],
+) -> dict[str, Any]:
+    previous_chapter_carry_over = (
+        _normalize_link_items(prev_chapter_plan.get("carry_over_to_next")) if isinstance(prev_chapter_plan, dict) else []
+    )
+    current_chapter_open_with = _normalize_link_items(chapter_plan.get("open_with"))
+    carry_source = "blueprint_prev_chapter" if previous_chapter_carry_over else "none"
+    open_with_source = "chapter_plan_open_with" if current_chapter_open_with else "none"
+
+    normalized_no = _normalize_chapter_no(chapter_no)
+    chapter_int = (
+        int(normalized_no)
+        if normalized_no.isdigit()
+        else max(int(start_chapter or 1), 1) + max(int(idx or 1) - 1, 0)
+    )
+    is_true_book_start = chapter_int <= 1
+    is_batch_first = int(idx or 1) == 1 and not is_true_book_start
+
+    if is_true_book_start:
+        return {
+            "previous_chapter_carry_over": [],
+            "current_chapter_open_with": [],
+            "is_batch_first": False,
+            "is_true_book_start": True,
+            "carry_source": "book_start",
+            "open_with_source": "book_start",
+        }
+
+    if is_batch_first and not previous_chapter_carry_over:
+        previous_chapter_carry_over = _derive_link_items_from_recent_capsule(
+            recent_continuity_capsules[-1] if recent_continuity_capsules else None
+        )
+        if previous_chapter_carry_over:
+            carry_source = "recent_continuity_capsule"
+        else:
+            previous_chapter_carry_over = _sanitize_text_list(
+                _collect_prev_threads_from_hard_pack(hard_pack_b),
+                max_items=3,
+                max_len=120,
+            )
+            if previous_chapter_carry_over:
+                carry_source = "hard_context_open_threads"
+
+    if is_batch_first and not previous_chapter_carry_over and current_chapter_open_with:
+        previous_chapter_carry_over = _sanitize_text_list(current_chapter_open_with, max_items=3, max_len=120)
+        if previous_chapter_carry_over:
+            carry_source = "chapter_plan_open_with_fallback"
+
+    if not current_chapter_open_with and previous_chapter_carry_over:
+        current_chapter_open_with = _sanitize_text_list(previous_chapter_carry_over, max_items=3, max_len=120)
+        open_with_source = "derived_from_previous_carry_over"
+    elif current_chapter_open_with and previous_chapter_carry_over:
+        has_overlap = any(
+            _link_items_match(carry_item, open_item)
+            for carry_item in previous_chapter_carry_over
+            for open_item in current_chapter_open_with
+        )
+        if not has_overlap:
+            anchored = [previous_chapter_carry_over[0], *current_chapter_open_with]
+            current_chapter_open_with = _sanitize_text_list(anchored, max_items=3, max_len=120)
+            open_with_source = "anchored_with_previous_carry_over"
+
+    return {
+        "previous_chapter_carry_over": previous_chapter_carry_over,
+        "current_chapter_open_with": current_chapter_open_with,
+        "is_batch_first": is_batch_first,
+        "is_true_book_start": is_true_book_start,
+        "carry_source": carry_source,
+        "open_with_source": open_with_source,
+    }
 
 
 def _redact_store_for_log(store: MemoryStore) -> dict[str, Any]:
@@ -2250,6 +3198,148 @@ def _redact_store_for_log(store: MemoryStore) -> dict[str, Any]:
 class OneClickBookGenerator:
     def __init__(self, llm_config: dict[str, Any]):
         self.llm = LLMClient(llm_config=llm_config)
+
+    def build_master_arc(
+        self,
+        *,
+        target_book_id: str,
+        world_spec: dict[str, Any],
+        template_profile: dict[str, Any],
+        total_chapters: int,
+        stage_size: int,
+        llm_max_retries: int,
+        llm_retry_backoff: float,
+        llm_backoff_factor: float,
+        llm_backoff_max: float,
+        llm_retry_jitter: float,
+    ) -> dict[str, Any]:
+        chapter_total = max(int(total_chapters or 0), 1)
+        stage_span = max(int(stage_size or 1), 1)
+        stage_count = max((chapter_total + stage_span - 1) // stage_span, 1)
+        prompt = (
+            "你是长篇小说总策划，请输出“全书总纲”JSON。\n"
+            "只输出 JSON，不要 markdown。\n"
+            "schema:\n"
+            "{"
+            '"book_title":"string","genre":"string","global_arc":["string"],'
+            '"ending_anchor":["string"],'
+            '"stage_outline":[{"stage_id":"0001_0100","stage_goal":"string","main_conflict":"string","must_keep_threads":["string"]}]'
+            "}\n"
+            "要求：\n"
+            "1) 所有文本使用简体中文；\n"
+            f"2) stage_outline 长度约为 {stage_count}，stage_id 按 {stage_span} 章分段；\n"
+            "3) global_arc/ending_anchor 必须可执行，不可使用空泛占位句。\n\n"
+            f"target_book_id: {target_book_id}\n"
+            f"chapter_total: {chapter_total}\n"
+            f"stage_size: {stage_span}\n"
+            f"world_spec: {json.dumps(world_spec, ensure_ascii=False)}\n"
+            f"template_profile_from_bookA: {json.dumps(template_profile, ensure_ascii=False)}"
+        )
+        try:
+            raw = self.llm.complete_with_retry(
+                prompt,
+                temperature=0.35,
+                max_tokens=3072,
+                max_retries=llm_max_retries,
+                retry_backoff=llm_retry_backoff,
+                backoff_factor=llm_backoff_factor,
+                backoff_max=llm_backoff_max,
+                retry_jitter=llm_retry_jitter,
+            )
+            parsed = _parse_json_object(raw)
+        except Exception:
+            parsed = {}
+        global_arc = _sanitize_text_list(parsed.get("global_arc"), max_items=10, max_len=140)
+        ending_anchor = _sanitize_text_list(parsed.get("ending_anchor"), max_items=8, max_len=140)
+        stage_outline_raw = parsed.get("stage_outline")
+        stage_outline: list[dict[str, Any]] = []
+        if isinstance(stage_outline_raw, list):
+            for row in stage_outline_raw:
+                if not isinstance(row, dict):
+                    continue
+                stage_outline.append(
+                    {
+                        "stage_id": str(row.get("stage_id") or "").strip(),
+                        "stage_goal": str(row.get("stage_goal") or "").strip(),
+                        "main_conflict": str(row.get("main_conflict") or "").strip(),
+                        "must_keep_threads": _sanitize_text_list(row.get("must_keep_threads"), max_items=6, max_len=120),
+                    }
+                )
+        if not global_arc:
+            global_arc = _sanitize_text_list(world_spec.get("global_arc"), max_items=8, max_len=140)
+        if not ending_anchor:
+            ending_anchor = _sanitize_text_list(world_spec.get("ending_anchor"), max_items=6, max_len=140)
+        return {
+            "target_book_id": target_book_id,
+            "book_title": str(parsed.get("book_title") or world_spec.get("book_title") or target_book_id).strip(),
+            "genre": str(parsed.get("genre") or world_spec.get("genre") or "").strip(),
+            "global_arc": global_arc,
+            "ending_anchor": ending_anchor,
+            "stage_outline": stage_outline,
+            "chapter_total": chapter_total,
+            "stage_size": stage_span,
+            "generated_at": datetime.now().isoformat(),
+        }
+
+    def build_stage_arc(
+        self,
+        *,
+        stage_start: int,
+        stage_end: int,
+        world_spec: dict[str, Any],
+        master_arc: dict[str, Any],
+        cross_batch_anchor: list[str],
+        llm_max_retries: int,
+        llm_retry_backoff: float,
+        llm_backoff_factor: float,
+        llm_backoff_max: float,
+        llm_retry_jitter: float,
+    ) -> dict[str, Any]:
+        sid = _stage_id(stage_start, stage_end)
+        prompt = (
+            "你是分卷策划，请输出阶段蓝图 JSON。\n"
+            "只输出 JSON，不要 markdown。\n"
+            "schema:\n"
+            "{"
+            '"stage_id":"0001_0100","stage_goal":"string","main_conflict":"string",'
+            '"must_keep_entities":["string"],"must_keep_threads":["string"],"batch_guidance":["string"]'
+            "}\n"
+            "要求：所有文本使用简体中文；batch_guidance 给出对后续20章批次细纲的硬约束。\n\n"
+            f"stage_id: {sid}\n"
+            f"stage_range: {stage_start}-{stage_end}\n"
+            f"cross_batch_anchor: {json.dumps(cross_batch_anchor, ensure_ascii=False)}\n"
+            f"master_arc: {json.dumps(master_arc, ensure_ascii=False)}\n"
+            f"world_spec: {json.dumps(world_spec, ensure_ascii=False)}"
+        )
+        try:
+            raw = self.llm.complete_with_retry(
+                prompt,
+                temperature=0.3,
+                max_tokens=2048,
+                max_retries=llm_max_retries,
+                retry_backoff=llm_retry_backoff,
+                backoff_factor=llm_backoff_factor,
+                backoff_max=llm_backoff_max,
+                retry_jitter=llm_retry_jitter,
+            )
+            parsed = _parse_json_object(raw)
+        except Exception:
+            parsed = {}
+        sanitized_cross_batch_anchor, _ = _sanitize_cross_batch_anchor_items(
+            cross_batch_anchor, max_items=3, max_len=320
+        )
+        return {
+            "stage_id": sid,
+            "stage_start": int(stage_start),
+            "stage_end": int(stage_end),
+            "stage_goal": str(parsed.get("stage_goal") or "").strip(),
+            "main_conflict": str(parsed.get("main_conflict") or "").strip(),
+            "must_keep_entities": _sanitize_text_list(parsed.get("must_keep_entities"), max_items=12, max_len=64),
+            "must_keep_threads": _sanitize_text_list(parsed.get("must_keep_threads"), max_items=10, max_len=120),
+            "batch_guidance": _sanitize_text_list(parsed.get("batch_guidance"), max_items=10, max_len=120),
+            "cross_batch_anchor": sanitized_cross_batch_anchor,
+            "generated_at": datetime.now().isoformat(),
+        }
 
     def _refine_chapter_titles(
         self,
@@ -2310,6 +3400,131 @@ class OneClickBookGenerator:
                 result.append({"chapter_no": chapter_no, "title": title})
         return result
 
+    def _repair_blueprint_pair_with_llm(
+        self,
+        *,
+        chapters: list[dict[str, Any]],
+        pair: dict[str, Any],
+        style: str,
+        llm_max_retries: int,
+        llm_retry_backoff: float,
+        llm_backoff_factor: float,
+        llm_backoff_max: float,
+        llm_retry_jitter: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        from_no = str(pair.get("from_chapter") or "").zfill(4)
+        to_no = str(pair.get("to_chapter") or "").zfill(4)
+        pair_issues = [str(item) for item in (pair.get("issues") or []) if str(item).strip()]
+        from_idx = next((idx for idx, row in enumerate(chapters) if str(row.get("chapter_no") or "").zfill(4) == from_no), -1)
+        to_idx = next((idx for idx, row in enumerate(chapters) if str(row.get("chapter_no") or "").zfill(4) == to_no), -1)
+        if from_idx < 0 or to_idx < 0 or to_idx != from_idx + 1:
+            return {
+                "from_chapter": from_no,
+                "to_chapter": to_no,
+                "status": "skip_invalid_pair",
+                "changed": False,
+                "issues": pair_issues,
+            }
+
+        current = chapters[from_idx]
+        nxt = chapters[to_idx]
+        prompt = (
+            "你是章节蓝图连续性修复编辑。请只修复相邻两章承接关系，不改章节编号，不改章节顺序。\n"
+            "只输出 JSON，不要 markdown，不要解释。\n"
+            "输出 schema:\n"
+            "{"
+            '"from_chapter":"0143","to_chapter":"0144",'
+            '"from_patch":{"open_with":["..."],"carry_over_to_next":["..."],"beat_outline":["..."]},'
+            '"to_patch":{"open_with":["..."],"carry_over_to_next":["..."],"beat_outline":["..."]}'
+            "}\n"
+            "硬约束：\n"
+            "1) from_patch.carry_over_to_next 至少一项必须在 to_patch.open_with 中被承接；\n"
+            "2) 两章 beat_outline 第一条都必须是可见开场动作，并分别与各自 open_with 对齐；\n"
+            "3) 不得把同一事件改写成平行版本，不得照抄上一章大段文本；\n"
+            "4) 仅返回这两章 patch 字段，文本为简体中文；\n"
+            f"5) ending_style={style}（closure 收束优先，soft 轻留白，hook 强钩子）。\n\n"
+            f"pair_issues: {json.dumps(pair_issues, ensure_ascii=False)}\n"
+            f"from_chapter_current: {json.dumps(current, ensure_ascii=False)}\n"
+            f"to_chapter_current: {json.dumps(nxt, ensure_ascii=False)}"
+        )
+        try:
+            repaired_raw = self.llm.complete_with_retry(
+                prompt,
+                temperature=0.1,
+                max_tokens=max_tokens,
+                max_retries=llm_max_retries,
+                retry_backoff=llm_retry_backoff,
+                backoff_factor=llm_backoff_factor,
+                backoff_max=llm_backoff_max,
+                retry_jitter=llm_retry_jitter,
+            )
+            repaired_obj = _parse_json_object(repaired_raw)
+        except Exception as exc:
+            return {
+                "from_chapter": from_no,
+                "to_chapter": to_no,
+                "status": f"llm_error:{type(exc).__name__}",
+                "changed": False,
+                "issues": pair_issues,
+            }
+
+        from_patch = repaired_obj.get("from_patch")
+        to_patch = repaired_obj.get("to_patch")
+        if not isinstance(from_patch, dict) or not isinstance(to_patch, dict):
+            return {
+                "from_chapter": from_no,
+                "to_chapter": to_no,
+                "status": "invalid_patch_payload",
+                "changed": False,
+                "issues": pair_issues,
+            }
+
+        changed = False
+        from_open = _normalize_link_items(from_patch.get("open_with"))
+        from_carry = _normalize_link_items(from_patch.get("carry_over_to_next"))
+        to_open = _normalize_link_items(to_patch.get("open_with"))
+        to_carry = _normalize_link_items(to_patch.get("carry_over_to_next"))
+        from_beats = _sanitize_text_list(from_patch.get("beat_outline"), max_items=8, max_len=120)
+        to_beats = _sanitize_text_list(to_patch.get("beat_outline"), max_items=8, max_len=120)
+
+        if from_open:
+            sanitized = _sanitize_text_list(from_open, max_items=3, max_len=120)
+            if sanitized != _normalize_link_items(current.get("open_with")):
+                current["open_with"] = sanitized
+                changed = True
+        if from_carry:
+            sanitized = _sanitize_text_list(from_carry, max_items=3, max_len=120)
+            if sanitized != _normalize_link_items(current.get("carry_over_to_next")):
+                current["carry_over_to_next"] = sanitized
+                changed = True
+        if to_open:
+            sanitized = _sanitize_text_list(to_open, max_items=3, max_len=120)
+            if sanitized != _normalize_link_items(nxt.get("open_with")):
+                nxt["open_with"] = sanitized
+                changed = True
+        if to_carry:
+            sanitized = _sanitize_text_list(to_carry, max_items=3, max_len=120)
+            if sanitized != _normalize_link_items(nxt.get("carry_over_to_next")):
+                nxt["carry_over_to_next"] = sanitized
+                changed = True
+        if from_beats:
+            if from_beats != _sanitize_text_list(current.get("beat_outline"), max_items=8, max_len=120):
+                current["beat_outline"] = from_beats
+                changed = True
+        if to_beats:
+            if to_beats != _sanitize_text_list(nxt.get("beat_outline"), max_items=8, max_len=120):
+                nxt["beat_outline"] = to_beats
+                changed = True
+
+        return {
+            "from_chapter": from_no,
+            "to_chapter": to_no,
+            "status": "patched" if changed else "no_change",
+            "changed": changed,
+            "issues": pair_issues,
+        }
+
     def build_blueprint(
         self,
         *,
@@ -2318,6 +3533,8 @@ class OneClickBookGenerator:
         template_profile: dict[str, Any],
         chapter_count: int,
         start_chapter: int,
+        previous_title_hint: str = "",
+        ending_style: str,
         max_tokens: int,
         llm_max_retries: int,
         llm_retry_backoff: float,
@@ -2325,6 +3542,9 @@ class OneClickBookGenerator:
         llm_backoff_max: float,
         llm_retry_jitter: float,
     ) -> dict[str, Any]:
+        style = str(ending_style or "closure").strip().lower()
+        if style not in ENDING_STYLES:
+            style = "closure"
         has_template_profile = bool(template_profile)
         if has_template_profile:
             role_line = "你是长篇小说策划编辑。根据世界观与模板参考，输出 Book B 的章节蓝图。\n"
@@ -2355,11 +3575,13 @@ class OneClickBookGenerator:
             "相邻章节标题避免同一语法骨架重复（例如连续“X的Y：Z”）。\n"
             "标题起句避免模板化：连续章节不要反复使用“关于……”或“在……处……”。\n"
             "硬约束：\n"
-            "1) ending_hook 必须具体，禁止使用“留下悬念/推动下一章”这类通用占位句。\n"
+            "1) ending_hook 可选；若填写必须具体，禁止使用“留下悬念/推动下一章”这类通用占位句。\n"
             "2) 每章必须给出 carry_over_to_next（遗留到下一章的具体事项）。\n"
             "3) 从第二章开始必须给出 open_with（开篇承接上一章事项）。\n"
             "4) 第N章 carry_over_to_next 至少一项应在第N+1章 open_with 对应。\n"
-            "5) 每章 beat_outline 第一条必须是可见的开场动作/事件，不得写成“已发生结论”。"
+            "5) 每章 beat_outline 第一条必须是可见的开场动作/事件，不得写成“已发生结论”。\n"
+            "6) 章末风格按 ending_style 执行：closure=阶段收束优先且不强行抛悬念，soft=轻留白，hook=强钩子。"
+            f"\nending_style: {style}"
         )
         raw = self.llm.complete_with_retry(
             prompt,
@@ -2404,7 +3626,12 @@ class OneClickBookGenerator:
         chapters_raw = parsed.get("chapters")
         if not isinstance(chapters_raw, list):
             chapters_raw = []
-        normalized_chapters = _normalize_chapter_plan(chapters_raw, chapter_count, start_chapter)
+        normalized_chapters = _normalize_chapter_plan(
+            chapters_raw,
+            chapter_count,
+            start_chapter,
+            ending_style=style,
+        )
         try:
             refined_titles = self._refine_chapter_titles(
                 chapters=normalized_chapters,
@@ -2435,9 +3662,29 @@ class OneClickBookGenerator:
                     chapter.get("title", ""),
                     chapter.get("goal", ""),
                 )
-        continuity_report = _validate_blueprint_continuity(normalized_chapters)
+        continuity_report = _validate_blueprint_continuity(
+            normalized_chapters,
+            start_chapter=start_chapter,
+            ending_style=style,
+        )
         continuity_repair_attempts = 0
         blueprint_auto_link_fix_count = 0
+        blueprint_auto_opening_anchor_fix_count = 0
+        if not continuity_report.get("ok"):
+            auto_patched_chapters, auto_link_fix_count = _auto_patch_blueprint_links(normalized_chapters)
+            auto_patched_chapters, auto_opening_fix_count = _auto_patch_opening_beats(
+                auto_patched_chapters,
+                start_chapter=start_chapter,
+            )
+            if auto_link_fix_count or auto_opening_fix_count:
+                normalized_chapters = auto_patched_chapters
+                blueprint_auto_link_fix_count += auto_link_fix_count
+                blueprint_auto_opening_anchor_fix_count += auto_opening_fix_count
+                continuity_report = _validate_blueprint_continuity(
+                    normalized_chapters,
+                    start_chapter=start_chapter,
+                    ending_style=style,
+                )
         for repair_round in range(1, 7):
             if continuity_report.get("ok"):
                 break
@@ -2450,8 +3697,9 @@ class OneClickBookGenerator:
                 "输出 schema:\n"
                 '{"chapters":[{"chapter_no":"0001","title":"文学感自由标题","goal":"...","conflict":"...","beat_outline":["..."],"ending_hook":"具体钩子","carry_over_to_next":["..."],"open_with":["..."]}]}\n'
                 f"硬约束：chapters 数组长度必须是 {chapter_count}，chapter_no 顺序与数量不可改变。\n"
-                "禁止通用空钩子；必须确保第N章 carry_over_to_next 至少一项在第N+1章 open_with 承接。\n"
+                "ending_hook 可选；若填写禁止通用空钩子；必须确保第N章 carry_over_to_next 至少一项在第N+1章 open_with 承接。\n"
                 "每章 beat_outline 第一条必须是可见开场动作，并与本章 open_with 对齐。\n"
+                f"章末风格 ending_style={style}（closure 收束优先，soft 轻留白，hook 强钩子）。\n"
                 "所有文本字段用简体中文。\n\n"
                 f"问题列表: {json.dumps(issue_preview, ensure_ascii=False)}\n"
                 f"承接诊断样例: {json.dumps(pair_preview, ensure_ascii=False)}\n"
@@ -2471,14 +3719,167 @@ class OneClickBookGenerator:
             repaired_chapters_raw = repaired_obj.get("chapters")
             if not isinstance(repaired_chapters_raw, list):
                 continue
-            normalized_chapters = _normalize_chapter_plan(repaired_chapters_raw, chapter_count, start_chapter)
-            continuity_report = _validate_blueprint_continuity(normalized_chapters)
+            normalized_chapters = _normalize_chapter_plan(
+                repaired_chapters_raw,
+                chapter_count,
+                start_chapter,
+                ending_style=style,
+            )
+            auto_patched_chapters, auto_link_fix_count = _auto_patch_blueprint_links(normalized_chapters)
+            auto_patched_chapters, auto_opening_fix_count = _auto_patch_opening_beats(
+                auto_patched_chapters,
+                start_chapter=start_chapter,
+            )
+            if auto_link_fix_count or auto_opening_fix_count:
+                normalized_chapters = auto_patched_chapters
+                blueprint_auto_link_fix_count += auto_link_fix_count
+                blueprint_auto_opening_anchor_fix_count += auto_opening_fix_count
+            continuity_report = _validate_blueprint_continuity(
+                normalized_chapters,
+                start_chapter=start_chapter,
+                ending_style=style,
+            )
 
-        title_diversity_alerts = _diversify_adjacent_titles(normalized_chapters)
+        title_diversity_alerts = _diversify_adjacent_titles(
+            normalized_chapters,
+            previous_title=previous_title_hint,
+        )
+
+        blueprint_opening_llm_repair_attempts = 0
+        blueprint_pair_llm_repair_rounds = 0
+        blueprint_pair_llm_repair_trace: list[dict[str, Any]] = []
+        if not continuity_report.get("ok"):
+            for repair_round in range(1, 5):
+                blueprint_opening_llm_repair_attempts = repair_round
+                issue_preview = continuity_report.get("issues", [])[:24]
+                repair_prompt = (
+                    "你是章节连续性修复编辑。请只修复跨章承接，不改 chapter_no 与章节数量。\n"
+                    "只输出 JSON 对象，不要 markdown，不要解释。\n"
+                    "输出 schema:\n"
+                    '{"chapters":[{"chapter_no":"0001","title":"文学感自由标题","goal":"...","conflict":"...",'
+                    '"beat_outline":["..."],"ending_hook":"具体钩子","carry_over_to_next":["..."],"open_with":["..."]}]}\n'
+                    f"硬约束：chapters 数组长度必须是 {chapter_count}，chapter_no 顺序不可变化。\n"
+                    "强约束：\n"
+                    "1) 第N章 carry_over_to_next 至少一项在第N+1章 open_with 对应；\n"
+                    "2) 每章 beat_outline 第一条必须与本章 open_with 对齐，且是可见开场动作（不得写成已发生结论）；\n"
+                    "3) 不得把同一事件改写成平行版本，不得整段复述上一章；\n"
+                    "4) 标题保留文学感并避免相邻重复骨架。\n\n"
+                    f"上一章标题提示: {previous_title_hint}\n"
+                    f"当前问题: {json.dumps(issue_preview, ensure_ascii=False)}\n"
+                    f"当前 chapters: {json.dumps(normalized_chapters, ensure_ascii=False)}"
+                )
+                repaired_raw = self.llm.complete_with_retry(
+                    repair_prompt,
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                    max_retries=llm_max_retries,
+                    retry_backoff=llm_retry_backoff,
+                    backoff_factor=llm_backoff_factor,
+                    backoff_max=llm_backoff_max,
+                    retry_jitter=llm_retry_jitter,
+                )
+                try:
+                    repaired_obj = _parse_json_object(repaired_raw)
+                except Exception:
+                    continue
+                repaired_chapters_raw = repaired_obj.get("chapters")
+                if not isinstance(repaired_chapters_raw, list):
+                    continue
+                normalized_chapters = _normalize_chapter_plan(
+                    repaired_chapters_raw,
+                    chapter_count,
+                    start_chapter,
+                    ending_style=style,
+                )
+                auto_patched_chapters, auto_link_fix_count = _auto_patch_blueprint_links(normalized_chapters)
+                auto_patched_chapters, auto_opening_fix_count = _auto_patch_opening_beats(
+                    auto_patched_chapters,
+                    start_chapter=start_chapter,
+                )
+                if auto_link_fix_count or auto_opening_fix_count:
+                    normalized_chapters = auto_patched_chapters
+                    blueprint_auto_link_fix_count += auto_link_fix_count
+                    blueprint_auto_opening_anchor_fix_count += auto_opening_fix_count
+                _diversify_adjacent_titles(normalized_chapters, previous_title=previous_title_hint)
+                continuity_report = _validate_blueprint_continuity(
+                    normalized_chapters,
+                    start_chapter=start_chapter,
+                    ending_style=style,
+                )
+                if continuity_report.get("ok"):
+                    break
 
         if not continuity_report.get("ok"):
-            normalized_chapters, blueprint_auto_link_fix_count = _auto_patch_blueprint_links(normalized_chapters)
-            continuity_report = _validate_blueprint_continuity(normalized_chapters)
+            for repair_round in range(1, 9):
+                failed_pairs = [
+                    pair
+                    for pair in (continuity_report.get("pairs") or [])
+                    if isinstance(pair, dict) and not bool(pair.get("ok"))
+                ]
+                if not failed_pairs:
+                    break
+                blueprint_pair_llm_repair_rounds = repair_round
+                round_trace: dict[str, Any] = {
+                    "round": repair_round,
+                    "failed_pair_count_before": len(failed_pairs),
+                    "pairs": [],
+                }
+                round_changed = False
+                for pair in failed_pairs:
+                    trace_item = self._repair_blueprint_pair_with_llm(
+                        chapters=normalized_chapters,
+                        pair=pair,
+                        style=style,
+                        llm_max_retries=llm_max_retries,
+                        llm_retry_backoff=llm_retry_backoff,
+                        llm_backoff_factor=llm_backoff_factor,
+                        llm_backoff_max=llm_backoff_max,
+                        llm_retry_jitter=llm_retry_jitter,
+                        max_tokens=max_tokens,
+                    )
+                    round_trace["pairs"].append(trace_item)
+                    if trace_item.get("changed"):
+                        round_changed = True
+                auto_patched_chapters, auto_link_fix_count = _auto_patch_blueprint_links(normalized_chapters)
+                auto_patched_chapters, auto_opening_fix_count = _auto_patch_opening_beats(
+                    auto_patched_chapters,
+                    start_chapter=start_chapter,
+                )
+                if auto_link_fix_count or auto_opening_fix_count:
+                    normalized_chapters = auto_patched_chapters
+                    blueprint_auto_link_fix_count += auto_link_fix_count
+                    blueprint_auto_opening_anchor_fix_count += auto_opening_fix_count
+                continuity_report = _validate_blueprint_continuity(
+                    normalized_chapters,
+                    start_chapter=start_chapter,
+                    ending_style=style,
+                )
+                round_trace["failed_pair_count_after"] = int(
+                    continuity_report.get("summary", {}).get("broken_link_count") or 0
+                )
+                round_trace["gate_ok_after_round"] = bool(continuity_report.get("ok"))
+                blueprint_pair_llm_repair_trace.append(round_trace)
+                if continuity_report.get("ok"):
+                    break
+                if not round_changed:
+                    break
+
+        failed_pairs_final = [
+            {
+                "from_chapter": str(pair.get("from_chapter") or "").zfill(4),
+                "to_chapter": str(pair.get("to_chapter") or "").zfill(4),
+                "issues": [str(item) for item in (pair.get("issues") or []) if str(item).strip()],
+            }
+            for pair in (continuity_report.get("pairs") or [])
+            if isinstance(pair, dict) and not bool(pair.get("ok"))
+        ]
+        summary = continuity_report.get("summary")
+        if isinstance(summary, dict):
+            summary["pair_llm_repair_rounds"] = blueprint_pair_llm_repair_rounds
+            summary["pair_llm_repair_trace_len"] = len(blueprint_pair_llm_repair_trace)
+            summary["failed_pairs_final_count"] = len(failed_pairs_final)
+            summary["auto_link_fix_count"] = blueprint_auto_link_fix_count
+            summary["auto_opening_anchor_fix_count"] = blueprint_auto_opening_anchor_fix_count
 
         if not continuity_report.get("ok"):
             raise RuntimeError(
@@ -2493,6 +3894,11 @@ class OneClickBookGenerator:
         parsed["_blueprint_continuity_report"] = continuity_report
         parsed["_blueprint_continuity_repair_attempts"] = continuity_repair_attempts
         parsed["_blueprint_auto_link_fix_count"] = blueprint_auto_link_fix_count
+        parsed["_blueprint_auto_opening_anchor_fix_count"] = blueprint_auto_opening_anchor_fix_count
+        parsed["_blueprint_opening_llm_repair_attempts"] = blueprint_opening_llm_repair_attempts
+        parsed["_blueprint_pair_llm_repair_rounds"] = blueprint_pair_llm_repair_rounds
+        parsed["_blueprint_pair_llm_repair_trace"] = blueprint_pair_llm_repair_trace
+        parsed["_blueprint_failed_pairs_final"] = failed_pairs_final
         parsed["_title_diversity_alerts"] = title_diversity_alerts
         return parsed
 
@@ -2507,9 +3913,11 @@ class OneClickBookGenerator:
         previous_chapter_carry_over: list[str],
         current_chapter_open_with: list[str],
         recent_continuity_capsules: list[dict[str, Any]],
+        reference_profile: dict[str, Any] | None,
         continuity_window: int,
         continuity_min_entities: int,
         continuity_min_open_threads: int,
+        ending_style: str,
         chapter_min_chars: int,
         chapter_max_chars: int,
         temperature: float,
@@ -2520,6 +3928,43 @@ class OneClickBookGenerator:
         llm_backoff_max: float,
         llm_retry_jitter: float,
     ) -> str:
+        style = str(ending_style or "closure").strip().lower()
+        if style not in ENDING_STYLES:
+            style = "closure"
+        reference_profile = reference_profile if isinstance(reference_profile, dict) else {}
+        anchor_entities = _sanitize_text_list(reference_profile.get("anchor_entities"), max_items=6, max_len=24)
+        pronoun_hints = [
+            f"{name}:{hint}"
+            for name, hint in (reference_profile.get("entity_pronoun_hint") or {}).items()
+            if str(name).strip() and str(hint).strip() in {"他", "她", "TA"}
+        ][:6]
+        pov_hint = str(reference_profile.get("pov_hint") or "").strip()
+        if pov_hint == "first_person":
+            pov_hint_text = "第一人称主叙"
+        elif pov_hint == "third_person":
+            pov_hint_text = "第三人称主叙"
+        else:
+            pov_hint_text = "mixed"
+        if style == "hook":
+            ending_rule_line = "- 章节结尾呼应 ending_hook，可制造明确钩子推进下一章\n"
+        elif style == "soft":
+            ending_rule_line = "- 章节结尾优先阶段收束，可保留轻微未决点，但避免硬反转式强钩子\n"
+        else:
+            ending_rule_line = "- 章节结尾优先阶段收束，不强行抛悬念；若 ending_hook 为空则禁止硬钩子\n"
+        hard_rules_text = (
+            f"硬约束：\n- 字数尽量在 {chapter_min_chars} 到 {chapter_max_chars} 中文字符之间\n"
+            "- 绝不违背 hard_context_from_bookB 的硬事实\n"
+            f"{ending_rule_line}"
+            "- 可借鉴模板，不可照抄文本\n"
+            "- 所有叙事文本、规则描述、状态描述均使用简体中文（专有ID/缩写可保留）\n"
+            "- 开篇前15%必须承接 current_chapter_open_with，且回应 previous_chapter_carry_over\n"
+            "- chapter_plan.beat_outline 的第1条必须在开篇20%内落地为可见动作/对话，不得只写回忆或结论\n"
+            "- 不得把承接事项写成读者未见过程的既成事实，至少写出一个现场推进片段\n"
+            "- 关键人物首次出现优先“名字+动作/对话”，不要仅用裸代词起句\n"
+            "- 已建立人物的代词不得反向漂移（他/她保持一致）\n"
+            f"- 必须延续最近上下文中的关键实体，尽量提及不少于 {max(continuity_min_entities, 0)} 个\n"
+            f"- 必须推进最近开放线索，尽量覆盖不少于 {max(continuity_min_open_threads, 0)} 条"
+        )
         prompt = (
             "你是中文长篇小说作者。请生成完整章节正文。\n"
             "Book B 需要保持自身硬一致性，并参考 Book A 模板节拍与风格。\n"
@@ -2531,17 +3976,12 @@ class OneClickBookGenerator:
             f"hard_context_from_bookB: {json.dumps(hard_pack_b, ensure_ascii=False)}\n"
             f"previous_chapter_carry_over: {json.dumps(previous_chapter_carry_over, ensure_ascii=False)}\n"
             f"current_chapter_open_with: {json.dumps(current_chapter_open_with, ensure_ascii=False)}\n"
+            f"opening_reference_profile: {json.dumps(reference_profile, ensure_ascii=False)}\n"
+            f"opening_anchor_entities: {json.dumps(anchor_entities, ensure_ascii=False)}\n"
+            f"opening_pronoun_hints: {json.dumps(pronoun_hints, ensure_ascii=False)}\n"
+            f"opening_pov_hint: {pov_hint_text}\n"
             f"recent_continuity_capsules_bookB: {json.dumps(recent_continuity_capsules[-max(continuity_window, 1):], ensure_ascii=False)}\n\n"
-            f"硬约束：\n- 字数尽量在 {chapter_min_chars} 到 {chapter_max_chars} 中文字符之间\n"
-            "- 绝不违背 hard_context_from_bookB 的硬事实\n"
-            "- 章节结尾呼应 ending_hook\n"
-            "- 可借鉴模板，不可照抄文本\n"
-            "- 所有叙事文本、规则描述、状态描述均使用简体中文（专有ID/缩写可保留）\n"
-            "- 开篇前15%必须承接 current_chapter_open_with，且回应 previous_chapter_carry_over\n"
-            "- chapter_plan.beat_outline 的第1条必须在开篇20%内落地为可见动作/对话，不得只写回忆或结论\n"
-            "- 不得把承接事项写成读者未见过程的既成事实，至少写出一个现场推进片段\n"
-            f"- 必须延续最近上下文中的关键实体，尽量提及不少于 {max(continuity_min_entities, 0)} 个\n"
-            f"- 必须推进最近开放线索，尽量覆盖不少于 {max(continuity_min_open_threads, 0)} 条"
+            f"{hard_rules_text}"
         )
         text = self.llm.complete_with_retry(
             prompt,
@@ -2554,6 +3994,105 @@ class OneClickBookGenerator:
             retry_jitter=llm_retry_jitter,
         )
         return _strip_markdown_code_blocks(text)
+
+    def rewrite_chapter_opening_for_continuity(
+        self,
+        *,
+        chapter_title: str,
+        chapter_plan: dict[str, Any],
+        chapter_text: str,
+        previous_chapter_carry_over: list[str],
+        current_chapter_open_with: list[str],
+        recent_continuity_capsules: list[dict[str, Any]],
+        continuity_issues: list[str],
+        previous_chapter_opening_text: str,
+        first_beat_expected: str,
+        reference_profile: dict[str, Any] | None,
+        opening_max_chars: int,
+        llm_max_retries: int,
+        llm_retry_backoff: float,
+        llm_backoff_factor: float,
+        llm_backoff_max: float,
+        llm_retry_jitter: float,
+    ) -> str:
+        body = str(chapter_text or "").strip()
+        if not body:
+            return body
+        opening_limit = max(int(opening_max_chars or 0), 260)
+        opening_text, remainder_text = _split_chapter_opening_window(
+            body,
+            max_chars=opening_limit,
+            min_chars=min(220, max(120, opening_limit // 2)),
+        )
+        if not opening_text:
+            return body
+        profile = reference_profile if isinstance(reference_profile, dict) else _build_opening_reference_profile(
+            previous_chapter_carry_over=previous_chapter_carry_over,
+            current_chapter_open_with=current_chapter_open_with,
+            previous_chapter_opening_text=previous_chapter_opening_text,
+            chapter_opening_text=opening_text,
+            recent_continuity_capsules=recent_continuity_capsules,
+        )
+        reference_attempts = max(OPENING_REFERENCE_REWRITE_MAX_ATTEMPTS, 1)
+        rewrite_issues = [str(item) for item in continuity_issues[:8]]
+        for _attempt in range(1, reference_attempts + 1):
+            prompt = (
+                "你是小说连载连续性编辑。请只重写“章节开头片段”，用于承接上一章，其他正文剧情不改。\n"
+                "只输出 JSON，不要 markdown，不要解释。\n"
+                'schema: {"opening":"重写后的开头正文"}\n'
+                "硬约束：\n"
+                "1) opening 必须是中文叙事正文，不得输出标题、编号、注释；\n"
+                "2) opening 必须显式承接 previous_chapter_carry_over 与 current_chapter_open_with 至少各1项；\n"
+                "3) 必须在开头落地 first_beat_expected（写成可见动作/对话，不写成既成事实）；\n"
+                "4) 禁止照抄 previous_chapter_opening_text；\n"
+                "5) 不得新增世界观硬设定，只做承接修补；\n"
+                "6) 保持角色代词一致，不得把“他/她”反向漂移；\n"
+                "7) 开头首次提及关键角色时优先“名字+动作/对话”，禁止裸代词主导。\n\n"
+                f"chapter_title: {chapter_title}\n"
+                f"chapter_plan: {json.dumps(chapter_plan, ensure_ascii=False)}\n"
+                f"continuity_issues: {json.dumps(rewrite_issues[:8], ensure_ascii=False)}\n"
+                f"reference_profile: {json.dumps(profile, ensure_ascii=False)}\n"
+                f"previous_chapter_carry_over: {json.dumps(previous_chapter_carry_over, ensure_ascii=False)}\n"
+                f"current_chapter_open_with: {json.dumps(current_chapter_open_with, ensure_ascii=False)}\n"
+                f"first_beat_expected: {first_beat_expected}\n"
+                f"recent_continuity_capsules_bookB: {json.dumps(recent_continuity_capsules[-3:], ensure_ascii=False)}\n"
+                f"previous_chapter_opening_text: {previous_chapter_opening_text[:700]}\n\n"
+                f"待重写 opening 原文:\n{opening_text}"
+            )
+            rewritten = self.llm.complete_with_retry(
+                prompt,
+                temperature=0.35,
+                max_tokens=max(512, min(1600, opening_limit * 2)),
+                max_retries=llm_max_retries,
+                retry_backoff=llm_retry_backoff,
+                backoff_factor=llm_backoff_factor,
+                backoff_max=llm_backoff_max,
+                retry_jitter=llm_retry_jitter,
+            )
+            candidate = ""
+            try:
+                parsed = _parse_json_object(rewritten)
+                candidate = str(parsed.get("opening") or "").strip()
+            except Exception:
+                candidate = _strip_markdown_code_blocks(rewritten).strip()
+            candidate = _strip_markdown_code_blocks(candidate)
+            candidate = _sanitize_generated_chapter_text(candidate, chapter_title)
+            if len(re.findall(r"[\u4e00-\u9fff]", candidate)) < 80:
+                rewrite_issues = ["重写开头字数不足，需补足完整现场叙事"]
+                continue
+            merged = candidate.strip()
+            if remainder_text:
+                merged = f"{merged}\n\n{remainder_text.strip()}"
+            reference_validation = _validate_opening_reference_consistency(
+                chapter_text=merged,
+                reference_profile=profile,
+                opening_max_chars=opening_limit,
+                min_anchor_hits=OPENING_REFERENCE_MIN_ANCHOR_HITS,
+            )
+            if reference_validation.get("ok"):
+                return merged.strip()
+            rewrite_issues = [str(item) for item in reference_validation.get("issues") or []]
+        return body
 
     def _normalize_continuity_capsule(
         self,
@@ -2707,6 +4246,254 @@ class OneClickBookGenerator:
         return summary.replace("\n", " ").strip()[:300]
 
 
+def _upsert_index_records(
+    records: list[dict[str, Any]],
+    *,
+    match_keys: tuple[str, ...],
+    payload: dict[str, Any],
+) -> None:
+    matched = False
+    for idx, row in enumerate(records):
+        if not isinstance(row, dict):
+            continue
+        if all(row.get(key) == payload.get(key) for key in match_keys):
+            records[idx] = payload
+            matched = True
+            break
+    if not matched:
+        records.append(payload)
+
+
+def _build_hierarchical_blueprint(
+    *,
+    args: argparse.Namespace,
+    generator: OneClickBookGenerator,
+    target_book_id: str,
+    world_spec: dict[str, Any],
+    template_profile: dict[str, Any],
+    output_dir: Path,
+    freeze_published_blueprint: bool,
+    stage_size: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    batch_start = max(int(args.start_chapter or 1), 1)
+    batch_end = batch_start + max(int(args.chapter_count or 0), 1) - 1
+    previous_title_hint = _load_previous_chapter_title(
+        output_dir=output_dir,
+        target_book_id=target_book_id,
+        chapter_no=batch_start,
+    )
+    blueprint_root_arg = str(getattr(args, "blueprint_root", "") or "").strip()
+    blueprint_root = (
+        Path(blueprint_root_arg).expanduser()
+        if blueprint_root_arg
+        else output_dir / "blueprints" / target_book_id
+    )
+    store = BlueprintStore(
+        root_dir=blueprint_root,
+        target_book_id=target_book_id,
+        stage_size=stage_size,
+        freeze_published=freeze_published_blueprint,
+    )
+    index = store.load_index()
+    existing_locked = max(int(index.get("locked_until") or 0), 0)
+    scan_limit = max(batch_end, int(index.get("book_total_chapters") or 0), existing_locked)
+    locked_until = _resolve_locked_until_from_files(
+        output_dir=output_dir,
+        target_book_id=target_book_id,
+        initial_locked_until=existing_locked,
+        scan_limit=scan_limit,
+    )
+    requested_total = max(int(getattr(args, "book_total_chapters", 0) or 0), 0)
+    total_chapters = max(requested_total, int(index.get("book_total_chapters") or 0), batch_end, locked_until)
+    index["locked_until"] = locked_until
+    index["book_total_chapters"] = total_chapters
+    index["stage_size"] = int(stage_size)
+    index["freeze_published_blueprint"] = bool(freeze_published_blueprint)
+
+    _, run_report_capsules = _load_run_report_context(output_dir, target_book_id)
+    cross_batch_anchor, cross_batch_anchor_source, cross_batch_anchor_meta = _load_cross_batch_anchor(
+        output_dir=output_dir,
+        target_book_id=target_book_id,
+        start_chapter=batch_start,
+        run_report_capsules=run_report_capsules,
+    )
+
+    master_arc = store.load_master_arc()
+    if not isinstance(master_arc, dict):
+        master_arc = generator.build_master_arc(
+            target_book_id=target_book_id,
+            world_spec=world_spec,
+            template_profile=template_profile,
+            total_chapters=total_chapters,
+            stage_size=stage_size,
+            llm_max_retries=args.llm_max_retries,
+            llm_retry_backoff=args.llm_retry_backoff,
+            llm_backoff_factor=args.llm_backoff_factor,
+            llm_backoff_max=args.llm_backoff_max,
+            llm_retry_jitter=args.llm_retry_jitter,
+        )
+        store.save_master_arc(master_arc)
+
+    touched_stage_bounds: list[tuple[int, int]] = []
+    stage_cursor = batch_start
+    while stage_cursor <= batch_end:
+        stage_start, stage_end = _stage_bounds_for_chapter(stage_cursor, stage_size)
+        touched_stage_bounds.append((stage_start, stage_end))
+        stage_cursor = stage_end + 1
+    touched_stage_bounds = list(dict.fromkeys(touched_stage_bounds))
+
+    stage_arcs: list[dict[str, Any]] = []
+    for stage_start, stage_end in touched_stage_bounds:
+        stage_arc = store.load_stage(stage_start, stage_end)
+        if not isinstance(stage_arc, dict):
+            stage_arc = generator.build_stage_arc(
+                stage_start=stage_start,
+                stage_end=stage_end,
+                world_spec=world_spec,
+                master_arc=master_arc,
+                cross_batch_anchor=cross_batch_anchor,
+                llm_max_retries=args.llm_max_retries,
+                llm_retry_backoff=args.llm_retry_backoff,
+                llm_backoff_factor=args.llm_backoff_factor,
+                llm_backoff_max=args.llm_backoff_max,
+                llm_retry_jitter=args.llm_retry_jitter,
+            )
+            store.save_stage(stage_start, stage_end, stage_arc)
+        stage_arcs.append(stage_arc)
+        _upsert_index_records(
+            index.setdefault("stages", []),
+            match_keys=("stage_id",),
+            payload={
+                "stage_id": _stage_id(stage_start, stage_end),
+                "stage_start": stage_start,
+                "stage_end": stage_end,
+                "path": str(store.stage_path(stage_start, stage_end)),
+                "updated_at": datetime.now().isoformat(),
+            },
+        )
+
+    batch_path = store.batch_path(batch_start, batch_end)
+    batch_blueprint: dict[str, Any] | None = None
+    batch_plan_source = "generated"
+    if freeze_published_blueprint and batch_path.exists():
+        existing_batch = store.load_batch(batch_start, batch_end)
+        if isinstance(existing_batch, dict):
+            cached_chapters_raw = existing_batch.get("chapters")
+            if isinstance(cached_chapters_raw, list):
+                cached_chapters = _normalize_chapter_plan(
+                    cached_chapters_raw,
+                    int(args.chapter_count),
+                    batch_start,
+                    ending_style=getattr(args, "ending_style", "closure"),
+                )
+                _diversify_adjacent_titles(cached_chapters, previous_title=previous_title_hint)
+                cached_report = _validate_blueprint_continuity(
+                    cached_chapters,
+                    start_chapter=batch_start,
+                    ending_style=getattr(args, "ending_style", "closure"),
+                )
+                if cached_report.get("ok"):
+                    existing_batch["chapters"] = cached_chapters
+                    existing_batch["_blueprint_continuity_report"] = cached_report
+                    existing_batch["_blueprint_auto_link_fix_count"] = 0
+                    existing_batch["_blueprint_opening_llm_repair_attempts"] = int(
+                        existing_batch.get("_blueprint_opening_llm_repair_attempts", 0) or 0
+                    )
+                    batch_blueprint = existing_batch
+                    batch_plan_source = "reuse_batch_cache"
+                else:
+                    print(
+                        f"[warn] cached batch {batch_start:04d}-{batch_end:04d} failed continuity gate; regenerate",
+                        flush=True,
+                    )
+            else:
+                print(
+                    f"[warn] cached batch {batch_start:04d}-{batch_end:04d} has invalid chapters payload; regenerate",
+                    flush=True,
+                )
+    if (
+        batch_blueprint is None
+        and freeze_published_blueprint
+        and batch_start <= locked_until
+        and not batch_path.exists()
+    ):
+        raise ValueError(
+            f"batch {batch_start:04d}-{batch_end:04d} overlaps locked chapters (<= {locked_until:04d}) "
+            "but no cached batch blueprint exists"
+        )
+
+    if batch_blueprint is None:
+        world_spec_for_blueprint = copy.deepcopy(world_spec)
+        world_spec_for_blueprint["hierarchical_blueprint_context"] = {
+            "mode": "hierarchical",
+            "batch_range": [batch_start, batch_end],
+            "locked_until": locked_until,
+            "cross_batch_anchor": cross_batch_anchor,
+            "cross_batch_anchor_raw": cross_batch_anchor_meta.get("raw", []),
+            "cross_batch_anchor_normalized": cross_batch_anchor_meta.get("normalized", cross_batch_anchor),
+            "cross_batch_anchor_truncated": bool(cross_batch_anchor_meta.get("truncated", False)),
+            "cross_batch_anchor_source": cross_batch_anchor_source,
+            "master_arc": master_arc,
+            "stage_arcs": stage_arcs,
+            "freeze_published_blueprint": bool(freeze_published_blueprint),
+        }
+        template_profile_for_blueprint: dict[str, Any] = (
+            copy.deepcopy(template_profile) if isinstance(template_profile, dict) else {}
+        )
+        if template_profile_for_blueprint:
+            template_profile_for_blueprint["hierarchical_hint"] = {
+                "batch_range": [batch_start, batch_end],
+                "cross_batch_anchor": cross_batch_anchor,
+            }
+        batch_blueprint = generator.build_blueprint(
+            target_book_id=target_book_id,
+            world_spec=world_spec_for_blueprint,
+            template_profile=template_profile_for_blueprint,
+            chapter_count=args.chapter_count,
+            start_chapter=args.start_chapter,
+            previous_title_hint=previous_title_hint,
+            ending_style=getattr(args, "ending_style", "closure"),
+            max_tokens=args.plan_max_tokens,
+            llm_max_retries=args.llm_max_retries,
+            llm_retry_backoff=args.llm_retry_backoff,
+            llm_backoff_factor=args.llm_backoff_factor,
+            llm_backoff_max=args.llm_backoff_max,
+            llm_retry_jitter=args.llm_retry_jitter,
+        )
+        store.save_batch(batch_start, batch_end, batch_blueprint)
+
+    _upsert_index_records(
+        index.setdefault("batches", []),
+        match_keys=("batch_start", "batch_end"),
+        payload={
+            "batch_start": batch_start,
+            "batch_end": batch_end,
+            "path": str(batch_path),
+            "source": batch_plan_source,
+            "stage_ids": [_stage_id(start, end) for start, end in touched_stage_bounds],
+            "updated_at": datetime.now().isoformat(),
+        },
+    )
+    store.save_index(index)
+    meta = {
+        "blueprint_mode": "hierarchical",
+        "blueprint_root": str(blueprint_root),
+        "stage_size": int(stage_size),
+        "batch_size": int(getattr(args, "batch_size", args.chapter_count) or args.chapter_count),
+        "batch_plan_source": batch_plan_source,
+        "locked_until": int(index.get("locked_until") or 0),
+        "cross_batch_anchor_source": cross_batch_anchor_source,
+        "cross_batch_anchor": cross_batch_anchor,
+        "cross_batch_anchor_raw": cross_batch_anchor_meta.get("raw", []),
+        "cross_batch_anchor_normalized": cross_batch_anchor_meta.get("normalized", cross_batch_anchor),
+        "cross_batch_anchor_truncated": bool(cross_batch_anchor_meta.get("truncated", False)),
+        "stage_ids": [_stage_id(start, end) for start, end in touched_stage_bounds],
+        "freeze_published_blueprint": bool(freeze_published_blueprint),
+        "blueprint_index_path": str(store.index_path),
+    }
+    return batch_blueprint, meta
+
+
 def _make_store(args: argparse.Namespace, prefix: str, fallback: str = "") -> MemoryStore:
     def _read(name: str, default: str) -> str:
         value = getattr(args, f"{prefix}_{name}", "")
@@ -2753,15 +4540,39 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
     continuity_retry = max(int(getattr(args, "continuity_retry", 3) or 3), 1)
     raw_min_entities = getattr(args, "continuity_min_entities", None)
     raw_min_open_threads = getattr(args, "continuity_min_open_threads", None)
+    raw_min_chapter_chars = getattr(args, "continuity_min_chars", None)
     continuity_min_entities = max(3 if raw_min_entities is None else int(raw_min_entities), 0)
     continuity_min_open_threads = max(1 if raw_min_open_threads is None else int(raw_min_open_threads), 0)
+    continuity_min_chars = max(2600 if raw_min_chapter_chars is None else int(raw_min_chapter_chars), 0)
+    raw_max_opening_overlap = getattr(args, "continuity_max_opening_overlap", DEFAULT_CONTINUITY_MAX_OPENING_OVERLAP)
+    continuity_max_opening_overlap = min(max(float(raw_max_opening_overlap or 0.0), 0.0), 0.99)
+    opening_rewrite_by_llm = bool(getattr(args, "opening_rewrite_by_llm", True))
+    opening_rewrite_max_attempts = max(int(getattr(args, "opening_rewrite_max_attempts", 2) or 0), 0)
+    opening_rewrite_max_chars = max(int(getattr(args, "opening_rewrite_max_chars", 820) or 820), 260)
+    batch_boundary_gate = bool(getattr(args, "batch_boundary_gate", True))
+    raw_resume_overwrite_range = str(getattr(args, "resume_overwrite_range", "") or "").strip()
+    try:
+        resume_overwrite_chapters = _parse_resume_overwrite_range(raw_resume_overwrite_range)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
     chapter_summary_style = str(getattr(args, "chapter_summary_style", "structured") or "structured")
     if chapter_summary_style not in {"structured", "short"}:
         raise ValueError("--chapter-summary-style must be one of: structured, short")
+    ending_style = str(getattr(args, "ending_style", "closure") or "closure").strip().lower()
+    if ending_style not in ENDING_STYLES:
+        allowed = ", ".join(sorted(ENDING_STYLES))
+        raise ValueError(f"--ending-style must be one of: {allowed}")
     blueprint_template_source = str(getattr(args, "blueprint_template_source", "none") or "none").strip().lower()
     if blueprint_template_source not in BLUEPRINT_TEMPLATE_SOURCES:
         allowed = ", ".join(sorted(BLUEPRINT_TEMPLATE_SOURCES))
         raise ValueError(f"--blueprint-template-source must be one of: {allowed}")
+    blueprint_mode = str(getattr(args, "blueprint_mode", "hierarchical") or "hierarchical").strip().lower()
+    if blueprint_mode not in BLUEPRINT_MODES:
+        allowed = ", ".join(sorted(BLUEPRINT_MODES))
+        raise ValueError(f"--blueprint-mode must be one of: {allowed}")
+    stage_size = max(int(getattr(args, "stage_size", 100) or 100), 1)
+    batch_size = max(int(getattr(args, "batch_size", args.chapter_count) or args.chapter_count), 1)
+    freeze_published_blueprint = bool(getattr(args, "freeze_published_blueprint", True))
     use_template_profile_for_blueprint = blueprint_template_source == "booka"
 
     target_store = _make_store(args, "target", fallback="legacy")
@@ -2829,7 +4640,12 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
             "target_book_id": target_book_id,
             "template_book_id": args.template_book_id,
             "world_spec": world_spec,
+            "blueprint_mode": blueprint_mode,
             "blueprint_template_source": blueprint_template_source,
+            "stage_size": stage_size,
+            "batch_size": batch_size,
+            "freeze_published_blueprint": freeze_published_blueprint,
+            "book_total_chapters": int(getattr(args, "book_total_chapters", 0) or 0),
             "blueprint_template_profile_included": bool(template_profile),
             "template_profile_from_bookA": template_profile,
             "template_store": _redact_store_for_log(template_store) if template_store else None,
@@ -2845,7 +4661,15 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
             "continuity_retry": continuity_retry,
             "continuity_min_entities": continuity_min_entities,
             "continuity_min_open_threads": continuity_min_open_threads,
+            "continuity_min_chars": continuity_min_chars,
+            "continuity_max_opening_overlap": continuity_max_opening_overlap,
+            "opening_rewrite_by_llm": opening_rewrite_by_llm,
+            "opening_rewrite_max_attempts": opening_rewrite_max_attempts,
+            "opening_rewrite_max_chars": opening_rewrite_max_chars,
+            "batch_boundary_gate": batch_boundary_gate,
+            "resume_overwrite_range": sorted(resume_overwrite_chapters),
             "chapter_summary_style": chapter_summary_style,
+            "ending_style": ending_style,
         }
         raw_payload = {
             **clean_payload,
@@ -2859,22 +4683,67 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         print(f"[log] book-level injections -> {path}", flush=True)
         if raw_path is not None:
             print(f"[log] book-level injections raw -> {raw_path}", flush=True)
-    blueprint = generator.build_blueprint(
+    blueprint_runtime_meta: dict[str, Any] = {
+        "blueprint_mode": blueprint_mode,
+        "blueprint_root": "",
+        "stage_size": stage_size,
+        "batch_size": batch_size,
+        "batch_plan_source": "generated",
+        "locked_until": 0,
+        "cross_batch_anchor_source": "none",
+        "cross_batch_anchor": [],
+        "cross_batch_anchor_raw": [],
+        "cross_batch_anchor_normalized": [],
+        "cross_batch_anchor_truncated": False,
+        "stage_ids": [],
+        "freeze_published_blueprint": freeze_published_blueprint,
+        "blueprint_index_path": "",
+    }
+    previous_title_hint = _load_previous_chapter_title(
+        output_dir=output_dir,
         target_book_id=target_book_id,
-        world_spec=world_spec,
-        template_profile=template_profile,
-        chapter_count=args.chapter_count,
-        start_chapter=args.start_chapter,
-        max_tokens=args.plan_max_tokens,
-        llm_max_retries=args.llm_max_retries,
-        llm_retry_backoff=args.llm_retry_backoff,
-        llm_backoff_factor=args.llm_backoff_factor,
-        llm_backoff_max=args.llm_backoff_max,
-        llm_retry_jitter=args.llm_retry_jitter,
+        chapter_no=int(args.start_chapter or 1),
     )
+    if blueprint_mode == "hierarchical":
+        blueprint, hierarchy_meta = _build_hierarchical_blueprint(
+            args=args,
+            generator=generator,
+            target_book_id=target_book_id,
+            world_spec=world_spec,
+            template_profile=template_profile,
+            output_dir=output_dir,
+            freeze_published_blueprint=freeze_published_blueprint,
+            stage_size=stage_size,
+        )
+        blueprint_runtime_meta.update(hierarchy_meta)
+    else:
+        blueprint = generator.build_blueprint(
+            target_book_id=target_book_id,
+            world_spec=world_spec,
+            template_profile=template_profile,
+            chapter_count=args.chapter_count,
+            start_chapter=args.start_chapter,
+            previous_title_hint=previous_title_hint,
+            ending_style=ending_style,
+            max_tokens=args.plan_max_tokens,
+            llm_max_retries=args.llm_max_retries,
+            llm_retry_backoff=args.llm_retry_backoff,
+            llm_backoff_factor=args.llm_backoff_factor,
+            llm_backoff_max=args.llm_backoff_max,
+            llm_retry_jitter=args.llm_retry_jitter,
+        )
     blueprint_continuity_report = blueprint.pop("_blueprint_continuity_report", {"ok": True, "issues": [], "pairs": []})
     blueprint_continuity_repair_attempts = int(blueprint.pop("_blueprint_continuity_repair_attempts", 0) or 0)
     blueprint_auto_link_fix_count = int(blueprint.pop("_blueprint_auto_link_fix_count", 0) or 0)
+    blueprint_auto_opening_anchor_fix_count = int(blueprint.pop("_blueprint_auto_opening_anchor_fix_count", 0) or 0)
+    blueprint_opening_llm_repair_attempts = int(blueprint.pop("_blueprint_opening_llm_repair_attempts", 0) or 0)
+    blueprint_pair_llm_repair_rounds = int(blueprint.pop("_blueprint_pair_llm_repair_rounds", 0) or 0)
+    blueprint_pair_llm_repair_trace = blueprint.pop("_blueprint_pair_llm_repair_trace", [])
+    blueprint_failed_pairs_final = blueprint.pop("_blueprint_failed_pairs_final", [])
+    if not isinstance(blueprint_pair_llm_repair_trace, list):
+        blueprint_pair_llm_repair_trace = []
+    if not isinstance(blueprint_failed_pairs_final, list):
+        blueprint_failed_pairs_final = []
     title_diversity_alerts = blueprint.pop("_title_diversity_alerts", [])
     blueprint_path = output_dir / f"{target_book_id}_blueprint.json"
     blueprint_path.write_text(json.dumps(blueprint, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2884,8 +4753,10 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
             "injection_blueprint_response.json",
             {
                 "target_book_id": target_book_id,
+                "blueprint_mode": blueprint_runtime_meta.get("blueprint_mode"),
                 "blueprint_template_source": blueprint_template_source,
                 "template_profile_included": bool(template_profile),
+                "hierarchical_runtime_meta": blueprint_runtime_meta,
                 "blueprint": blueprint,
             },
         )
@@ -2897,6 +4768,11 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                 "blueprint_path": str(blueprint_path),
                 "repair_attempts": blueprint_continuity_repair_attempts,
                 "auto_link_fix_count": blueprint_auto_link_fix_count,
+                "auto_opening_anchor_fix_count": blueprint_auto_opening_anchor_fix_count,
+                "opening_llm_repair_attempts": blueprint_opening_llm_repair_attempts,
+                "pair_llm_repair_rounds": blueprint_pair_llm_repair_rounds,
+                "pair_llm_repair_trace": blueprint_pair_llm_repair_trace,
+                "failed_pairs_final": blueprint_failed_pairs_final,
                 "title_diversity_alerts": title_diversity_alerts,
                 "report": blueprint_continuity_report,
             },
@@ -2907,6 +4783,7 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
     if args.commit_memory:
         from chapter_processor import ChapterProcessor
 
+        delta_debug_dir = str(injection_logger.run_dir / "chapters") if injection_logger is not None else ""
         processor = ChapterProcessor(
             neo4j_uri=target_store.neo4j_uri,
             neo4j_user=target_store.neo4j_user,
@@ -2924,35 +4801,97 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
             chinese_backoff_factor=args.llm_backoff_factor,
             chinese_backoff_max=args.llm_backoff_max,
             chinese_retry_jitter=args.llm_retry_jitter,
+            delta_json_repair_attempts=args.delta_json_repair_attempts,
+            delta_parse_debug_log=args.delta_parse_debug_log,
+            delta_parse_debug_dir=delta_debug_dir,
         )
 
     run_items: list[dict[str, Any]] = []
     rolling_continuity_capsules: list[dict[str, Any]] = []
-    existing_summaries = _load_run_report_summaries(output_dir, target_book_id) if args.resume else {}
+    existing_summaries: dict[str, str] = {}
+    preload_meta: dict[str, Any] = {
+        "history_start": None,
+        "history_end": None,
+        "from_run_report": 0,
+        "from_chapter_files": 0,
+        "preloaded_count": 0,
+    }
+    if args.resume:
+        existing_summaries, run_report_capsules = _load_run_report_context(output_dir, target_book_id)
+        rolling_continuity_capsules, preload_meta = _preload_recent_continuity_capsules(
+            output_dir=output_dir,
+            target_book_id=target_book_id,
+            start_chapter=int(args.start_chapter or 1),
+            continuity_window=continuity_window,
+            blueprint_chapters=blueprint.get("chapters", []),
+            summary_map=existing_summaries,
+            run_report_capsules=run_report_capsules,
+        )
+        if preload_meta.get("preloaded_count", 0):
+            history_start = preload_meta.get("history_start")
+            history_end = preload_meta.get("history_end")
+            range_text = (
+                f"{int(history_start):04d}-{int(history_end):04d}"
+                if isinstance(history_start, int) and isinstance(history_end, int)
+                else "n/a"
+            )
+            print(
+                (
+                    f"[resume] preloaded continuity capsules={preload_meta.get('preloaded_count', 0)} "
+                    f"(range={range_text}, from_report={preload_meta.get('from_run_report', 0)}, "
+                    f"from_files={preload_meta.get('from_chapter_files', 0)})"
+                ),
+                flush=True,
+            )
     all_done_chapters: set[str] = set()
     if args.resume and processor is not None:
         all_done_chapters = _load_all_done_chapters(target_store.canon_db_path, target_book_id)
+    if args.resume and resume_overwrite_chapters:
+        first = min(resume_overwrite_chapters)
+        last = max(resume_overwrite_chapters)
+        print(
+            (
+                f"[resume] force-overwrite chapters={len(resume_overwrite_chapters)} "
+                f"(range={first}-{last}) from --resume-overwrite-range"
+            ),
+            flush=True,
+        )
     started = time.monotonic()
     ok_count = 0
     fail_count = 0
+    memory_failed_count = 0
+    opening_rewrite_attempts_total = 0
+    opening_rewrite_success_total = 0
     terminated = False
     blueprint_meta = {k: v for k, v in blueprint.items() if k != "chapters"}
+    chapter_opening_excerpt_cache: dict[str, str] = {}
+    if int(args.start_chapter or 1) > 1:
+        previous_no = int(args.start_chapter) - 1
+        previous_key = f"{previous_no:04d}"
+        previous_path = output_dir / f"{target_book_id}_chapter_{previous_key}.md"
+        previous_opening = _read_chapter_opening_excerpt(previous_path, fallback_title=previous_key)
+        if previous_opening:
+            chapter_opening_excerpt_cache[previous_key] = previous_opening
 
     try:
         for idx, chapter in enumerate(blueprint["chapters"], 1):
             chapter_no = chapter["chapter_no"]
             chapter_title = chapter["title"]
             chapter_path = output_dir / f"{target_book_id}_chapter_{chapter_no}.md"
+            force_overwrite = bool(args.resume and chapter_no in resume_overwrite_chapters)
 
-            if args.resume and chapter_path.exists():
+            if args.resume and chapter_path.exists() and not force_overwrite:
                 if processor is None or chapter_no in all_done_chapters:
+                    chapter_markdown = chapter_path.read_text(encoding="utf-8")
+                    _, chapter_text = _extract_chapter_title_and_text(chapter_markdown, fallback_title=chapter_title)
+                    chapter_opening_excerpt_cache[chapter_no] = _extract_opening_excerpt(chapter_text)
                     summary = existing_summaries.get(chapter_no) or chapter_title
                     rolling_continuity_capsules.append(
                         _build_fallback_continuity_capsule(
                             chapter_no=chapter_no,
                             chapter_title=chapter_title,
                             chapter_plan=chapter,
-                            chapter_text=chapter_path.read_text(encoding="utf-8"),
+                            chapter_text=chapter_text,
                             chapter_summary=summary,
                             hard_pack_b={},
                         )
@@ -2969,10 +4908,8 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
 
                 # Resume mode with memory commit enabled: recover missing commit from existing chapter file.
                 chapter_markdown = chapter_path.read_text(encoding="utf-8")
-                chapter_text = chapter_markdown
-                heading = f"# {chapter_title}"
-                if chapter_markdown.startswith(heading):
-                    chapter_text = chapter_markdown[len(heading) :].lstrip("\n").strip()
+                _, chapter_text = _extract_chapter_title_and_text(chapter_markdown, fallback_title=chapter_title)
+                chapter_opening_excerpt_cache[chapter_no] = _extract_opening_excerpt(chapter_text)
                 fallback_summary = chapter_text.replace("\n", " ").strip()[:220]
                 summary = existing_summaries.get(chapter_no) or fallback_summary or chapter_title
                 rolling_continuity_capsules.append(
@@ -2985,28 +4922,40 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                         hard_pack_b={},
                     )
                 )
-                memory_commit = processor.process_chapter(
-                    book_id=target_book_id,
-                    chapter_no=chapter_no,
-                    chapter_title=chapter_title,
-                    chapter_summary=summary,
-                    chapter_text=chapter_text,
-                    assets=None,
-                    mode="llm",
-                )
-                if memory_commit.get("status") == "blocked":
-                    raise RuntimeError(f"blocking conflicts: {memory_commit.get('conflicts')}")
-                all_done_chapters.add(chapter_no)
-                run_items.append(
-                    {
-                        "chapter_no": chapter_no,
-                        "title": chapter_title,
-                        "status": "resumed_commit",
-                        "summary": summary,
-                        "path": str(chapter_path),
-                        "memory_commit": memory_commit,
-                    }
-                )
+                item = {
+                    "chapter_no": chapter_no,
+                    "title": chapter_title,
+                    "status": "resumed_commit",
+                    "summary": summary,
+                    "path": str(chapter_path),
+                }
+                try:
+                    memory_commit = processor.process_chapter(
+                        book_id=target_book_id,
+                        chapter_no=chapter_no,
+                        chapter_title=chapter_title,
+                        chapter_summary=summary,
+                        chapter_text=chapter_text,
+                        assets=None,
+                        mode="llm",
+                    )
+                    item["memory_commit"] = memory_commit
+                    if memory_commit.get("status") == "blocked":
+                        raise RuntimeError(f"blocking conflicts: {memory_commit.get('conflicts')}")
+                    all_done_chapters.add(chapter_no)
+                except Exception as exc:
+                    if args.delta_json_fail_policy == "mark_warning" and _is_delta_json_parse_error(exc):
+                        item["status"] = "resumed_commit_memory_failed"
+                        item["memory_commit_status"] = "failed"
+                        item["error_code"] = _classify_runtime_error(exc)
+                        item["error"] = str(exc)
+                        debug_log_path = getattr(exc, "debug_log_path", None)
+                        if debug_log_path:
+                            item["debug_log_path"] = str(debug_log_path)
+                        memory_failed_count += 1
+                    else:
+                        raise
+                run_items.append(item)
                 ok_count += 1
                 elapsed = time.monotonic() - started
                 eta = (elapsed / idx) * (len(blueprint["chapters"]) - idx) if idx else 0
@@ -3016,18 +4965,14 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                     flush=True,
                 )
                 continue
+            elif force_overwrite and chapter_path.exists():
+                print(
+                    f"[resume] overwrite chapter {chapter_no} due to --resume-overwrite-range",
+                    flush=True,
+                )
 
             try:
                 prev_chapter_plan = blueprint["chapters"][idx - 2] if idx > 1 else {}
-                previous_chapter_carry_over = (
-                    _normalize_link_items(prev_chapter_plan.get("carry_over_to_next"))
-                    if isinstance(prev_chapter_plan, dict)
-                    else []
-                )
-                current_chapter_open_with = _normalize_link_items(chapter.get("open_with"))
-                if idx == 1:
-                    # Chapter 1 has no previous chapter; do not enforce synthetic open_with carry-over.
-                    current_chapter_open_with = []
                 chapter_beats = _sanitize_text_list(chapter.get("beat_outline"), max_items=8, max_len=120)
                 first_beat_expected = chapter_beats[0] if chapter_beats else ""
                 raw_template_pack = (
@@ -3055,11 +5000,55 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                     rolling_continuity_capsules,
                     continuity_window,
                 )
+                linkage = _resolve_chapter_linkage(
+                    chapter_no=chapter_no,
+                    idx=idx,
+                    start_chapter=int(args.start_chapter or 1),
+                    chapter_plan=chapter,
+                    prev_chapter_plan=prev_chapter_plan,
+                    recent_continuity_capsules=recent_capsules_for_prompt,
+                    hard_pack_b=hard_pack_b,
+                )
+                previous_chapter_carry_over = _normalize_link_items(linkage.get("previous_chapter_carry_over"))
+                current_chapter_open_with = _normalize_link_items(linkage.get("current_chapter_open_with"))
+                carry_over_required_for_gate = (
+                    previous_chapter_carry_over if (batch_boundary_gate and linkage.get("is_batch_first")) else []
+                )
+                previous_opening_text = ""
+                normalized_chapter_no = _normalize_chapter_no(chapter_no)
+                if normalized_chapter_no.isdigit():
+                    chapter_int = int(normalized_chapter_no)
+                    if chapter_int > 1:
+                        prev_key = f"{chapter_int - 1:04d}"
+                        previous_opening_text = chapter_opening_excerpt_cache.get(prev_key, "")
+                        if not previous_opening_text:
+                            prev_path = output_dir / f"{target_book_id}_chapter_{prev_key}.md"
+                            previous_opening_text = _read_chapter_opening_excerpt(prev_path, fallback_title=prev_key)
+                            if previous_opening_text:
+                                chapter_opening_excerpt_cache[prev_key] = previous_opening_text
+                opening_reference_profile = _build_opening_reference_profile(
+                    previous_chapter_carry_over=previous_chapter_carry_over,
+                    current_chapter_open_with=current_chapter_open_with,
+                    previous_chapter_opening_text=previous_opening_text,
+                    chapter_opening_text="",
+                    recent_continuity_capsules=recent_capsules_for_prompt,
+                )
                 if injection_logger is not None:
                     clean_payload = {
                         "target_book_id": target_book_id,
                         "template_book_id": args.template_book_id,
                         "chapter_no": chapter_no,
+                        "blueprint_mode": blueprint_runtime_meta.get("blueprint_mode", blueprint_mode),
+                        "stage_ids": blueprint_runtime_meta.get("stage_ids", []),
+                        "cross_batch_anchor_source": blueprint_runtime_meta.get("cross_batch_anchor_source", "none"),
+                        "cross_batch_anchor": blueprint_runtime_meta.get("cross_batch_anchor", []),
+                        "cross_batch_anchor_raw": blueprint_runtime_meta.get("cross_batch_anchor_raw", []),
+                        "cross_batch_anchor_normalized": blueprint_runtime_meta.get(
+                            "cross_batch_anchor_normalized", []
+                        ),
+                        "cross_batch_anchor_truncated": bool(
+                            blueprint_runtime_meta.get("cross_batch_anchor_truncated", False)
+                        ),
                         "world_spec": world_spec,
                         "book_blueprint_meta": blueprint_meta,
                         "chapter_plan": chapter,
@@ -3067,13 +5056,27 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                         "hard_context_from_bookB": hard_pack_b,
                         "previous_chapter_carry_over": previous_chapter_carry_over,
                         "current_chapter_open_with": current_chapter_open_with,
+                        "is_batch_first": bool(linkage.get("is_batch_first")),
+                        "is_true_book_start": bool(linkage.get("is_true_book_start")),
+                        "resolved_carry_source": linkage.get("carry_source"),
+                        "resolved_previous_carry_source": linkage.get("carry_source"),
+                        "resolved_open_with_source": linkage.get("open_with_source"),
+                        "carry_over_required_for_gate": carry_over_required_for_gate,
                         "recent_continuity_capsules_bookB": recent_capsules_for_prompt,
                         "continuity_mode": continuity_mode,
                         "continuity_window": continuity_window,
                         "continuity_retry": continuity_retry,
                         "continuity_min_entities": continuity_min_entities,
                         "continuity_min_open_threads": continuity_min_open_threads,
+                        "continuity_min_chars": continuity_min_chars,
+                        "continuity_max_opening_overlap": continuity_max_opening_overlap,
+                        "opening_rewrite_by_llm": opening_rewrite_by_llm,
+                        "opening_rewrite_max_attempts": opening_rewrite_max_attempts,
+                        "opening_rewrite_max_chars": opening_rewrite_max_chars,
+                        "opening_reference_profile": opening_reference_profile,
+                        "batch_boundary_gate": batch_boundary_gate,
                         "chapter_summary_style": chapter_summary_style,
+                        "ending_style": ending_style,
                     }
                     raw_payload = {
                         **clean_payload,
@@ -3108,9 +5111,11 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                         previous_chapter_carry_over=previous_chapter_carry_over,
                         current_chapter_open_with=current_chapter_open_with,
                         recent_continuity_capsules=recent_capsules_for_prompt,
+                        reference_profile=opening_reference_profile,
                         continuity_window=continuity_window,
                         continuity_min_entities=continuity_min_entities,
                         continuity_min_open_threads=continuity_min_open_threads,
+                        ending_style=ending_style,
                         chapter_min_chars=args.chapter_min_chars,
                         chapter_max_chars=args.chapter_max_chars,
                         temperature=args.temperature,
@@ -3149,11 +5154,31 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                         recent_capsules=rolling_continuity_capsules,
                         hard_pack_b=hard_pack_b,
                         open_with_expected=current_chapter_open_with,
+                        required_carry_over=carry_over_required_for_gate,
+                        previous_chapter_opening_text=previous_opening_text,
+                        max_opening_overlap=continuity_max_opening_overlap,
                         first_beat_expected=first_beat_expected,
                         continuity_window=continuity_window,
                         min_entities=continuity_min_entities,
                         min_open_threads=continuity_min_open_threads,
+                        min_chapter_chars=continuity_min_chars,
                     )
+                    reference_validation = _validate_opening_reference_consistency(
+                        chapter_text=chapter_text,
+                        reference_profile=opening_reference_profile,
+                        opening_max_chars=opening_rewrite_max_chars,
+                        min_anchor_hits=OPENING_REFERENCE_MIN_ANCHOR_HITS,
+                    )
+                    if not reference_validation.get("ok"):
+                        validation_result = {
+                            "ok": False,
+                            "issues": list(validation_result.get("issues") or [])
+                            + [str(item) for item in (reference_validation.get("issues") or [])],
+                            "metrics": {
+                                **(validation_result.get("metrics") or {}),
+                                "opening_reference_validation": reference_validation,
+                            },
+                        }
                     if validation_result.get("ok"):
                         break
 
@@ -3166,6 +5191,106 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     if continuity_mode != "strict_gate":
                         break
+                    if (
+                        opening_rewrite_by_llm
+                        and opening_rewrite_max_attempts > 0
+                        and _issues_need_opening_rewrite(issues)
+                    ):
+                        for rewrite_round in range(1, opening_rewrite_max_attempts + 1):
+                            opening_rewrite_attempts_total += 1
+                            rewritten_text_raw = generator.rewrite_chapter_opening_for_continuity(
+                                chapter_title=chapter_title,
+                                chapter_plan=chapter,
+                                chapter_text=chapter_text,
+                                previous_chapter_carry_over=previous_chapter_carry_over,
+                                current_chapter_open_with=current_chapter_open_with,
+                                recent_continuity_capsules=recent_capsules_for_prompt,
+                                continuity_issues=[str(issue) for issue in issues],
+                                previous_chapter_opening_text=previous_opening_text,
+                                first_beat_expected=first_beat_expected,
+                                reference_profile=opening_reference_profile,
+                                opening_max_chars=opening_rewrite_max_chars,
+                                llm_max_retries=args.llm_max_retries,
+                                llm_retry_backoff=args.llm_retry_backoff,
+                                llm_backoff_factor=args.llm_backoff_factor,
+                                llm_backoff_max=args.llm_backoff_max,
+                                llm_retry_jitter=args.llm_retry_jitter,
+                            )
+                            rewritten_text = _sanitize_generated_chapter_text(rewritten_text_raw, chapter_title)
+                            if not rewritten_text or rewritten_text == chapter_text:
+                                continue
+                            rewritten_capsule = generator.build_continuity_capsule(
+                                chapter_no=chapter_no,
+                                chapter_title=chapter_title,
+                                chapter_plan=chapter,
+                                chapter_text=rewritten_text,
+                                hard_pack_b=hard_pack_b,
+                                summary_style=chapter_summary_style,
+                                llm_max_retries=args.llm_max_retries,
+                                llm_retry_backoff=args.llm_retry_backoff,
+                                llm_backoff_factor=args.llm_backoff_factor,
+                                llm_backoff_max=args.llm_backoff_max,
+                                llm_retry_jitter=args.llm_retry_jitter,
+                            )
+                            rewritten_summary = str(rewritten_capsule.get("chapter_summary") or "").strip()[:300]
+                            if not rewritten_summary:
+                                rewritten_summary = rewritten_text.replace("\n", " ").strip()[:300]
+                                rewritten_capsule["chapter_summary"] = rewritten_summary
+                            rewritten_validation = _validate_chapter_continuity(
+                                chapter_text=rewritten_text,
+                                recent_capsules=rolling_continuity_capsules,
+                                hard_pack_b=hard_pack_b,
+                                open_with_expected=current_chapter_open_with,
+                                required_carry_over=carry_over_required_for_gate,
+                                previous_chapter_opening_text=previous_opening_text,
+                                max_opening_overlap=continuity_max_opening_overlap,
+                                first_beat_expected=first_beat_expected,
+                                continuity_window=continuity_window,
+                                min_entities=continuity_min_entities,
+                                min_open_threads=continuity_min_open_threads,
+                                min_chapter_chars=continuity_min_chars,
+                            )
+                            rewritten_reference_validation = _validate_opening_reference_consistency(
+                                chapter_text=rewritten_text,
+                                reference_profile=opening_reference_profile,
+                                opening_max_chars=opening_rewrite_max_chars,
+                                min_anchor_hits=OPENING_REFERENCE_MIN_ANCHOR_HITS,
+                            )
+                            if not rewritten_reference_validation.get("ok"):
+                                rewritten_validation = {
+                                    "ok": False,
+                                    "issues": list(rewritten_validation.get("issues") or [])
+                                    + [str(item) for item in (rewritten_reference_validation.get("issues") or [])],
+                                    "metrics": {
+                                        **(rewritten_validation.get("metrics") or {}),
+                                        "opening_reference_validation": rewritten_reference_validation,
+                                    },
+                                }
+                            if rewritten_validation.get("ok"):
+                                chapter_text = rewritten_text
+                                capsule = rewritten_capsule
+                                summary = rewritten_summary
+                                validation_result = rewritten_validation
+                                opening_rewrite_success_total += 1
+                                print(
+                                    (
+                                        f"[info] chapter {chapter_no} opening continuity repaired by LLM "
+                                        f"(attempt {attempt}, rewrite {rewrite_round}/{opening_rewrite_max_attempts})"
+                                    ),
+                                    flush=True,
+                                )
+                                break
+                            rewritten_issues = rewritten_validation.get("issues") or []
+                            print(
+                                (
+                                    f"[warn] chapter {chapter_no} opening LLM rewrite failed "
+                                    f"{rewrite_round}/{opening_rewrite_max_attempts}: "
+                                    f"{'; '.join(str(item) for item in rewritten_issues[:6])}"
+                                ),
+                                flush=True,
+                            )
+                        if validation_result.get("ok"):
+                            break
                     if attempt >= generation_attempts:
                         raise RuntimeError(f"chapter {chapter_no} continuity gate failed: {last_validation_error}")
                     time.sleep(min(2.0 * attempt, 8.0))
@@ -3180,8 +5305,15 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                         f"{'; '.join(validation_result.get('issues') or [])}",
                         flush=True,
                     )
+                opening_reference_validation = _validate_opening_reference_consistency(
+                    chapter_text=chapter_text,
+                    reference_profile=opening_reference_profile,
+                    opening_max_chars=opening_rewrite_max_chars,
+                    min_anchor_hits=OPENING_REFERENCE_MIN_ANCHOR_HITS,
+                )
 
                 rolling_continuity_capsules.append(capsule)
+                chapter_opening_excerpt_cache[chapter_no] = _extract_opening_excerpt(chapter_text)
                 chapter_path.write_text(f"# {chapter_title}\n\n{chapter_text.strip()}\n", encoding="utf-8")
                 item = {
                     "chapter_no": chapter_no,
@@ -3191,27 +5323,51 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                     "path": str(chapter_path),
                     "continuity_validation": validation_result,
                     "continuity_capsule": capsule,
+                    "opening_reference_profile": opening_reference_profile,
+                    "opening_reference_validation": opening_reference_validation,
                 }
 
                 if processor is not None:
-                    memory_commit = processor.process_chapter(
-                        book_id=target_book_id,
-                        chapter_no=chapter_no,
-                        chapter_title=chapter_title,
-                        chapter_summary=summary,
-                        chapter_text=chapter_text,
-                        assets=None,
-                        mode="llm",
-                    )
-                    item["memory_commit"] = memory_commit
-                    if memory_commit.get("status") == "blocked":
-                        raise RuntimeError(f"blocking conflicts: {memory_commit.get('conflicts')}")
-                    all_done_chapters.add(chapter_no)
+                    try:
+                        memory_commit = processor.process_chapter(
+                            book_id=target_book_id,
+                            chapter_no=chapter_no,
+                            chapter_title=chapter_title,
+                            chapter_summary=summary,
+                            chapter_text=chapter_text,
+                            assets=None,
+                            mode="llm",
+                        )
+                        item["memory_commit"] = memory_commit
+                        if memory_commit.get("status") == "blocked":
+                            raise RuntimeError(f"blocking conflicts: {memory_commit.get('conflicts')}")
+                        all_done_chapters.add(chapter_no)
+                    except Exception as exc:
+                        if args.delta_json_fail_policy == "mark_warning" and _is_delta_json_parse_error(exc):
+                            item["status"] = "generated_memory_failed"
+                            item["memory_commit_status"] = "failed"
+                            item["error_code"] = _classify_runtime_error(exc)
+                            item["error"] = str(exc)
+                            debug_log_path = getattr(exc, "debug_log_path", None)
+                            if debug_log_path:
+                                item["debug_log_path"] = str(debug_log_path)
+                            memory_failed_count += 1
+                        else:
+                            raise
 
                 run_items.append(item)
                 ok_count += 1
             except Exception as exc:  # pragma: no cover - operational path
-                run_items.append({"chapter_no": chapter_no, "title": chapter_title, "status": "failed", "error": str(exc)})
+                run_items.append(
+                    {
+                        "chapter_no": chapter_no,
+                        "title": chapter_title,
+                        "status": "failed",
+                        "error": str(exc),
+                        "error_code": _classify_runtime_error(exc),
+                        "debug_log_path": getattr(exc, "debug_log_path", None),
+                    }
+                )
                 fail_count += 1
                 if args.consistency_policy == "strict_blocking":
                     terminated = True
@@ -3231,7 +5387,10 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         if processor is not None:
             processor.close()
 
-    title_style_metrics = _compute_title_style_metrics(blueprint.get("chapters", []))
+    title_style_metrics = _compute_title_style_metrics(
+        blueprint.get("chapters", []),
+        previous_title=previous_title_hint,
+    )
     carry_open_checks = 0
     carry_open_hits = 0
     for item in run_items:
@@ -3251,6 +5410,30 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         if opening_hits > 0:
             carry_open_hits += 1
     carry_open_hit_rate = (carry_open_hits / carry_open_checks) if carry_open_checks else None
+    if blueprint_runtime_meta.get("blueprint_mode") == "hierarchical":
+        locked_after = _resolve_locked_until_from_files(
+            output_dir=output_dir,
+            target_book_id=target_book_id,
+            initial_locked_until=int(blueprint_runtime_meta.get("locked_until") or 0),
+        )
+        blueprint_runtime_meta["locked_until"] = locked_after
+        blueprint_root_runtime = str(blueprint_runtime_meta.get("blueprint_root") or "").strip()
+        if blueprint_root_runtime:
+            store = BlueprintStore(
+                root_dir=Path(blueprint_root_runtime),
+                target_book_id=target_book_id,
+                stage_size=int(blueprint_runtime_meta.get("stage_size") or stage_size),
+                freeze_published=bool(blueprint_runtime_meta.get("freeze_published_blueprint", True)),
+            )
+            idx_payload = store.load_index()
+            idx_payload["locked_until"] = max(int(idx_payload.get("locked_until") or 0), int(locked_after))
+            idx_payload["book_total_chapters"] = max(
+                int(idx_payload.get("book_total_chapters") or 0),
+                int(getattr(args, "book_total_chapters", 0) or 0),
+                int(args.start_chapter) + int(args.chapter_count) - 1,
+                int(locked_after),
+            )
+            store.save_index(idx_payload)
 
     report = {
         "target_book_id": target_book_id,
@@ -3265,11 +5448,52 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         "continuity_retry": continuity_retry,
         "continuity_min_entities": continuity_min_entities,
         "continuity_min_open_threads": continuity_min_open_threads,
+        "continuity_min_chars": continuity_min_chars,
+        "continuity_max_opening_overlap": continuity_max_opening_overlap,
+        "delta_json_repair_attempts": args.delta_json_repair_attempts,
+        "delta_json_fail_policy": args.delta_json_fail_policy,
+        "delta_parse_debug_log": bool(args.delta_parse_debug_log),
+        "opening_rewrite_by_llm": opening_rewrite_by_llm,
+        "opening_rewrite_max_attempts": opening_rewrite_max_attempts,
+        "opening_rewrite_max_chars": opening_rewrite_max_chars,
+        "opening_rewrite_attempts_total": opening_rewrite_attempts_total,
+        "opening_rewrite_success_total": opening_rewrite_success_total,
+        "batch_boundary_gate": batch_boundary_gate,
+        "resume_overwrite_range": sorted(resume_overwrite_chapters),
+        "preloaded_continuity_capsules": int(preload_meta.get("preloaded_count") or 0),
+        "preloaded_history_range": [
+            preload_meta.get("history_start"),
+            preload_meta.get("history_end"),
+        ],
+        "preloaded_from_run_report": int(preload_meta.get("from_run_report") or 0),
+        "preloaded_from_chapter_files": int(preload_meta.get("from_chapter_files") or 0),
         "chapter_summary_style": chapter_summary_style,
+        "ending_style": ending_style,
+        "blueprint_mode": blueprint_runtime_meta.get("blueprint_mode", blueprint_mode),
+        "stage_size": int(blueprint_runtime_meta.get("stage_size") or stage_size),
+        "batch_size": int(blueprint_runtime_meta.get("batch_size") or batch_size),
+        "freeze_published_blueprint": bool(
+            blueprint_runtime_meta.get("freeze_published_blueprint", freeze_published_blueprint)
+        ),
+        "blueprint_root": blueprint_runtime_meta.get("blueprint_root"),
+        "blueprint_index_path": blueprint_runtime_meta.get("blueprint_index_path"),
+        "published_blueprint_locked_until": int(blueprint_runtime_meta.get("locked_until") or 0),
+        "batch_plan_source": blueprint_runtime_meta.get("batch_plan_source", "generated"),
+        "stage_ids": blueprint_runtime_meta.get("stage_ids", []),
+        "cross_batch_anchor_source": blueprint_runtime_meta.get("cross_batch_anchor_source", "none"),
+        "cross_batch_anchor": blueprint_runtime_meta.get("cross_batch_anchor", []),
+        "cross_batch_anchor_raw": blueprint_runtime_meta.get("cross_batch_anchor_raw", []),
+        "cross_batch_anchor_normalized": blueprint_runtime_meta.get("cross_batch_anchor_normalized", []),
+        "cross_batch_anchor_truncated": bool(blueprint_runtime_meta.get("cross_batch_anchor_truncated", False)),
         "blueprint_template_source": blueprint_template_source,
         "blueprint_gate_passed": bool(blueprint_continuity_report.get("ok", False)),
         "blueprint_repair_attempts": blueprint_continuity_repair_attempts,
         "blueprint_auto_link_fix_count": blueprint_auto_link_fix_count,
+        "blueprint_auto_opening_anchor_fix_count": blueprint_auto_opening_anchor_fix_count,
+        "blueprint_opening_llm_repair_attempts": blueprint_opening_llm_repair_attempts,
+        "blueprint_pair_llm_repair_rounds": blueprint_pair_llm_repair_rounds,
+        "blueprint_pair_llm_repair_trace": blueprint_pair_llm_repair_trace,
+        "blueprint_failed_pairs_final": blueprint_failed_pairs_final,
         "title_diversity_alerts": title_diversity_alerts,
         "title_pattern_distribution": title_style_metrics.get("title_pattern_distribution", {}),
         "adjacent_title_dup_count": int(title_style_metrics.get("adjacent_title_dup_count") or 0),
@@ -3277,6 +5501,7 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         "carry_open_checks": carry_open_checks,
         "blueprint_continuity_summary": blueprint_continuity_report.get("summary", {}),
         "ok": ok_count,
+        "memory_failed": memory_failed_count,
         "failed": fail_count,
         "terminated": terminated,
         "items": run_items,
@@ -3291,12 +5516,38 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
         "failed": fail_count,
         "terminated": terminated,
         "continuity_mode": continuity_mode,
+        "continuity_min_chars": continuity_min_chars,
+        "ending_style": ending_style,
+        "continuity_max_opening_overlap": continuity_max_opening_overlap,
+        "delta_json_repair_attempts": args.delta_json_repair_attempts,
+        "delta_json_fail_policy": args.delta_json_fail_policy,
+        "delta_parse_debug_log": bool(args.delta_parse_debug_log),
+        "opening_rewrite_by_llm": opening_rewrite_by_llm,
+        "opening_rewrite_max_attempts": opening_rewrite_max_attempts,
+        "opening_rewrite_max_chars": opening_rewrite_max_chars,
+        "opening_rewrite_attempts_total": opening_rewrite_attempts_total,
+        "opening_rewrite_success_total": opening_rewrite_success_total,
+        "batch_boundary_gate": batch_boundary_gate,
+        "resume_overwrite_range": sorted(resume_overwrite_chapters),
+        "preloaded_continuity_capsules": int(preload_meta.get("preloaded_count") or 0),
+        "blueprint_mode": blueprint_runtime_meta.get("blueprint_mode", blueprint_mode),
+        "stage_size": int(blueprint_runtime_meta.get("stage_size") or stage_size),
+        "batch_size": int(blueprint_runtime_meta.get("batch_size") or batch_size),
+        "batch_plan_source": blueprint_runtime_meta.get("batch_plan_source", "generated"),
+        "published_blueprint_locked_until": int(blueprint_runtime_meta.get("locked_until") or 0),
+        "blueprint_root": blueprint_runtime_meta.get("blueprint_root"),
+        "blueprint_index_path": blueprint_runtime_meta.get("blueprint_index_path"),
         "blueprint_template_source": blueprint_template_source,
         "blueprint_gate_passed": bool(blueprint_continuity_report.get("ok", False)),
         "blueprint_repair_attempts": blueprint_continuity_repair_attempts,
         "blueprint_auto_link_fix_count": blueprint_auto_link_fix_count,
+        "blueprint_auto_opening_anchor_fix_count": blueprint_auto_opening_anchor_fix_count,
+        "blueprint_opening_llm_repair_attempts": blueprint_opening_llm_repair_attempts,
+        "blueprint_pair_llm_repair_rounds": blueprint_pair_llm_repair_rounds,
+        "blueprint_failed_pairs_final": blueprint_failed_pairs_final,
         "adjacent_title_dup_count": int(title_style_metrics.get("adjacent_title_dup_count") or 0),
         "carry_open_hit_rate": carry_open_hit_rate,
+        "memory_failed": memory_failed_count,
         "blueprint_path": str(blueprint_path),
         "report_path": str(report_path),
         "output_dir": str(output_dir),
@@ -3329,6 +5580,12 @@ def default_run_options() -> dict[str, Any]:
         "llm_backoff_max": 60.0,
         "llm_retry_jitter": 0.5,
         "reference_top_k": 12,
+        "blueprint_mode": "hierarchical",
+        "stage_size": 100,
+        "batch_size": 20,
+        "freeze_published_blueprint": True,
+        "blueprint_root": "",
+        "book_total_chapters": 0,
         "blueprint_template_source": "none",
         "consistency_policy": "strict_blocking",
         "continuity_mode": "strict_gate",
@@ -3336,7 +5593,18 @@ def default_run_options() -> dict[str, Any]:
         "continuity_window": 12,
         "continuity_min_entities": 3,
         "continuity_min_open_threads": 1,
+        "continuity_min_chars": 2600,
+        "continuity_max_opening_overlap": DEFAULT_CONTINUITY_MAX_OPENING_OVERLAP,
+        "delta_json_repair_attempts": 2,
+        "delta_json_fail_policy": "mark_warning",
+        "delta_parse_debug_log": True,
+        "opening_rewrite_by_llm": True,
+        "opening_rewrite_max_attempts": 2,
+        "opening_rewrite_max_chars": 820,
+        "batch_boundary_gate": True,
+        "resume_overwrite_range": "",
         "chapter_summary_style": "structured",
+        "ending_style": "closure",
         "enforce_isolation": True,
         "resume": False,
         "commit_memory": False,
@@ -3405,6 +5673,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-retry-jitter", type=float, default=0.5)
     parser.add_argument("--reference-top-k", type=int, default=12)
     parser.add_argument(
+        "--blueprint-mode",
+        choices=sorted(BLUEPRINT_MODES),
+        default="hierarchical",
+        help="Blueprint planner mode: hierarchical (master/stage/batch) or flat (single-run batch blueprint).",
+    )
+    parser.add_argument("--stage-size", type=int, default=100, help="Stage span in chapters for hierarchical mode.")
+    parser.add_argument("--batch-size", type=int, default=20, help="Expected batch size for hierarchical metadata.")
+    parser.add_argument("--blueprint-root", default="", help="Optional directory for persisted hierarchical blueprints.")
+    parser.add_argument("--book-total-chapters", type=int, default=0, help="Optional full-book chapter target.")
+    parser.add_argument("--freeze-published-blueprint", action="store_true", default=True)
+    parser.add_argument("--no-freeze-published-blueprint", action="store_false", dest="freeze_published_blueprint")
+    parser.add_argument(
         "--blueprint-template-source",
         choices=sorted(BLUEPRINT_TEMPLATE_SOURCES),
         default="none",
@@ -3416,10 +5696,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--continuity-window", type=int, default=12)
     parser.add_argument("--continuity-min-entities", type=int, default=3)
     parser.add_argument("--continuity-min-open-threads", type=int, default=1)
+    parser.add_argument("--continuity-min-chars", type=int, default=2600)
+    parser.add_argument(
+        "--continuity-max-opening-overlap",
+        type=float,
+        default=DEFAULT_CONTINUITY_MAX_OPENING_OVERLAP,
+        help="Max allowed opening overlap ratio vs previous chapter opening (Jaccard on Chinese bigrams).",
+    )
+    parser.add_argument(
+        "--delta-json-repair-attempts",
+        type=int,
+        default=2,
+        help="Max LLM repair rounds for malformed delta JSON before raising parse error.",
+    )
+    parser.add_argument(
+        "--delta-json-fail-policy",
+        choices=["mark_warning", "fail"],
+        default="mark_warning",
+        help="When delta JSON parse fails during memory commit: mark warning and continue, or fail the chapter.",
+    )
+    parser.add_argument("--delta-parse-debug-log", action="store_true", default=True)
+    parser.add_argument("--no-delta-parse-debug-log", action="store_false", dest="delta_parse_debug_log")
+    parser.add_argument("--opening-rewrite-by-llm", action="store_true", default=True)
+    parser.add_argument("--no-opening-rewrite-by-llm", action="store_false", dest="opening_rewrite_by_llm")
+    parser.add_argument("--opening-rewrite-max-attempts", type=int, default=2)
+    parser.add_argument("--opening-rewrite-max-chars", type=int, default=820)
+    parser.add_argument("--batch-boundary-gate", action="store_true", default=True)
+    parser.add_argument("--no-batch-boundary-gate", action="store_false", dest="batch_boundary_gate")
     parser.add_argument("--chapter-summary-style", choices=["structured", "short"], default="structured")
+    parser.add_argument(
+        "--ending-style",
+        choices=sorted(ENDING_STYLES),
+        default="closure",
+        help="Chapter ending style: closure(收束优先), soft(轻留白), hook(强钩子).",
+    )
     parser.add_argument("--enforce-isolation", action="store_true", default=True)
     parser.add_argument("--no-enforce-isolation", action="store_false", dest="enforce_isolation")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--resume-overwrite-range",
+        default="",
+        help="In --resume mode, force regenerate listed chapter numbers/ranges (e.g. 0081-0100,0123).",
+    )
     parser.add_argument("--commit-memory", action="store_true")
 
     # legacy shared store args

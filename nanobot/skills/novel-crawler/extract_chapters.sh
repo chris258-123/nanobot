@@ -35,13 +35,20 @@ log ""
 for page in $(seq $START_PAGE $END_PAGE); do
     log "正在提取第 $page 页..."
 
-    agent-browser open "${BASE_URL}/${page}/"
+    if [ "$page" -eq 1 ]; then
+        PAGE_URL="${BASE_URL}/"
+    else
+        PAGE_URL="${BASE_URL}/${page}/"
+    fi
+
+    agent-browser open "$PAGE_URL"
     sleep 2
 
     agent-browser snapshot | \
         grep -A 2 "link.*第.*章" | \
         grep "url:" | \
-        sed 's/.*url: //' >> "$CHAPTER_LIST"
+        sed 's/.*url: //' | \
+        grep -Ev '_[0-9]+\.html$' >> "$CHAPTER_LIST"
 done
 
 # 关闭浏览器

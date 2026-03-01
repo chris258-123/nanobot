@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -23,6 +25,23 @@ def _strip_markdown_code_blocks(content: str) -> str:
     return content.strip()
 
 
+class DeltaParseError(ValueError):
+    """Raised when chapter delta JSON cannot be parsed after repair attempts."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        chapter_no: str,
+        debug_log_path: str | None = None,
+        last_error: Exception | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.chapter_no = chapter_no
+        self.debug_log_path = debug_log_path
+        self.last_error = last_error
+
+
 class DeltaExtractorLLM:
     """Generate per-chapter delta payloads from chapter text and memory context."""
 
@@ -31,11 +50,17 @@ class DeltaExtractorLLM:
         llm_config: dict[str, Any],
         timeout: float = 120.0,
         max_tokens: int | None = None,
+        json_repair_attempts: int = 2,
+        parse_debug_dir: str | Path | None = None,
+        parse_debug_log: bool = True,
     ):
         self.llm_config = llm_config
         self.timeout = timeout
         config_max_tokens = llm_config.get("max_tokens")
         self.max_tokens = int(max_tokens or config_max_tokens or 4096)
+        self.json_repair_attempts = max(int(json_repair_attempts or 0), 0)
+        self.parse_debug_log = bool(parse_debug_log)
+        self.parse_debug_dir = Path(parse_debug_dir).expanduser() if parse_debug_dir else None
 
     @staticmethod
     def empty_delta() -> dict[str, list]:
@@ -67,30 +92,170 @@ class DeltaExtractorLLM:
         )
         response = self._call_llm(prompt)
         cleaned = _strip_markdown_code_blocks(response)
-        parsed = self._parse_json(cleaned)
+        parsed = self._parse_json(cleaned, chapter_no=chapter_no, raw_response=response)
         return self._normalize_output(parsed)
 
-    def _parse_json(self, content: str) -> dict[str, Any]:
-        """Parse JSON with small repairs for common LLM formatting glitches."""
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            pass
+    @staticmethod
+    def _make_json_candidates(content: str) -> list[tuple[str, str]]:
+        candidates: list[tuple[str, str]] = [("raw", content)]
+        sanitized = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", content)
+        if sanitized != content:
+            candidates.append(("strip_control_chars", sanitized))
 
-        start = content.find("{")
-        end = content.rfind("}")
+        working = sanitized
+        start = working.find("{")
+        end = working.rfind("}")
         if start != -1 and end > start:
-            sliced = content[start : end + 1]
-            try:
-                return json.loads(sliced)
-            except json.JSONDecodeError:
-                content = sliced
+            sliced = working[start : end + 1]
+            if sliced != working:
+                candidates.append(("slice_outer_object", sliced))
+                working = sliced
 
         # Remove trailing commas before ] or }, which are common in model output.
-        repaired = re.sub(r",\s*([}\]])", r"\1", content)
-        return json.loads(repaired)
+        repaired = re.sub(r",\s*([}\]])", r"\1", working)
+        if repaired != working:
+            candidates.append(("remove_trailing_commas", repaired))
 
-    def _call_llm(self, prompt: str) -> str:
+        unique: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for label, text in candidates:
+            if text in seen:
+                continue
+            seen.add(text)
+            unique.append((label, text))
+        return unique
+
+    def _parse_json(self, content: str, *, chapter_no: str, raw_response: str) -> dict[str, Any]:
+        """Parse JSON with layered repairs and optional LLM JSON repair rounds."""
+        parse_attempts: list[dict[str, Any]] = []
+        last_error: Exception | None = None
+
+        def _try_candidates(text: str, source: str) -> dict[str, Any] | None:
+            nonlocal last_error
+            for stage, candidate in self._make_json_candidates(text):
+                try:
+                    parsed = json.loads(candidate)
+                    if not isinstance(parsed, dict):
+                        raise ValueError("Expected JSON object")
+                    return parsed
+                except Exception as exc:  # pragma: no cover - small branch wrapper
+                    last_error = exc
+                    parse_attempts.append(
+                        {
+                            "source": source,
+                            "stage": stage,
+                            "error_type": exc.__class__.__name__,
+                            "error": str(exc),
+                        }
+                    )
+            return None
+
+        parsed = _try_candidates(content, "initial")
+        if parsed is not None:
+            return parsed
+
+        llm_repairs: list[dict[str, Any]] = []
+        repair_input = content
+        for round_idx in range(1, self.json_repair_attempts + 1):
+            repair_result = self._repair_json_with_llm(repair_input)
+            llm_repairs.append(
+                {
+                    "round": round_idx,
+                    "input_sha256": hashlib.sha256(repair_input.encode("utf-8", errors="ignore")).hexdigest(),
+                    "output_sha256": hashlib.sha256(repair_result.encode("utf-8", errors="ignore")).hexdigest(),
+                }
+            )
+            parsed = _try_candidates(repair_result, f"llm_repair_round_{round_idx}")
+            if parsed is not None:
+                return parsed
+            repair_input = repair_result
+
+        debug_log_path = self._write_parse_debug_log(
+            chapter_no=chapter_no,
+            raw_response=raw_response,
+            cleaned_content=content,
+            parse_attempts=parse_attempts,
+            llm_repairs=llm_repairs,
+            last_error=last_error,
+        )
+        error_suffix = f"; debug={debug_log_path}" if debug_log_path else ""
+        raise DeltaParseError(
+            f"Failed to parse delta JSON for chapter {chapter_no}: {last_error}{error_suffix}",
+            chapter_no=chapter_no,
+            debug_log_path=debug_log_path,
+            last_error=last_error,
+        )
+
+    def _repair_json_with_llm(self, invalid_json: str) -> str:
+        """Ask the same model to rewrite malformed JSON into a valid JSON object."""
+        snippet = invalid_json.strip()
+        if len(snippet) > 20000:
+            snippet = snippet[:20000]
+        prompt = (
+            "你是 JSON 修复器。把下面内容修复为合法 JSON 对象。\n"
+            "要求：\n"
+            "1) 只能输出 JSON 对象本体，不要解释。\n"
+            "2) 保持原有字段语义，不要新增无关字段。\n"
+            "3) 允许删除明显损坏且无法修复的片段。\n\n"
+            "待修复内容：\n"
+            f"{snippet}"
+        )
+        repaired = self._call_llm(
+            prompt,
+            temperature=0.0,
+            max_tokens=min(max(self.max_tokens, 2048), 8192),
+        )
+        return _strip_markdown_code_blocks(repaired)
+
+    def _write_parse_debug_log(
+        self,
+        *,
+        chapter_no: str,
+        raw_response: str,
+        cleaned_content: str,
+        parse_attempts: list[dict[str, Any]],
+        llm_repairs: list[dict[str, Any]],
+        last_error: Exception | None,
+    ) -> str | None:
+        if not self.parse_debug_log or self.parse_debug_dir is None:
+            return None
+        try:
+            self.parse_debug_dir.mkdir(parents=True, exist_ok=True)
+            path = self.parse_debug_dir / f"{chapter_no}_delta_parse_failure.json"
+
+            def _tail(text: str, size: int = 800) -> str:
+                return text[-size:] if len(text) > size else text
+
+            payload = {
+                "chapter_no": chapter_no,
+                "error_type": last_error.__class__.__name__ if last_error else None,
+                "error": str(last_error) if last_error else "unknown parse failure",
+                "error_line": getattr(last_error, "lineno", None),
+                "error_col": getattr(last_error, "colno", None),
+                "error_pos": getattr(last_error, "pos", None),
+                "raw_sha256": hashlib.sha256(raw_response.encode("utf-8", errors="ignore")).hexdigest(),
+                "cleaned_sha256": hashlib.sha256(cleaned_content.encode("utf-8", errors="ignore")).hexdigest(),
+                "raw_preview_head": raw_response[:800],
+                "raw_preview_tail": _tail(raw_response),
+                "cleaned_preview_head": cleaned_content[:800],
+                "cleaned_preview_tail": _tail(cleaned_content),
+                "parse_attempts": parse_attempts,
+                "llm_repairs": llm_repairs,
+            }
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return str(path)
+        except Exception:
+            return None
+
+    def _call_llm(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.1,
+        max_tokens: int | None = None,
+    ) -> str:
+        requested_max_tokens = int(max_tokens or self.max_tokens)
+
         def _pop_proxy_env() -> dict[str, str]:
             backup: dict[str, str] = {}
             for key in (
@@ -119,8 +284,8 @@ class DeltaExtractorLLM:
                     json={
                         "model": self.llm_config["model"],
                         "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
-                        "max_tokens": self.max_tokens,
+                        "temperature": temperature,
+                        "max_tokens": requested_max_tokens,
                     },
                     headers={"Authorization": f"Bearer {self.llm_config['api_key']}"},
                     timeout=self.timeout,
@@ -152,8 +317,8 @@ class DeltaExtractorLLM:
                     provider.chat(
                         messages=[{"role": "user", "content": prompt}],
                         model=self.llm_config["model"],
-                        max_tokens=self.max_tokens,
-                        temperature=0.1,
+                        max_tokens=requested_max_tokens,
+                        temperature=temperature,
                     ),
                     timeout=self.timeout,
                 )

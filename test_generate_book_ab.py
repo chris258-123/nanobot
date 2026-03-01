@@ -169,6 +169,19 @@ def test_injection_logger_can_write_clean_and_raw_payloads(tmp_path: Path) -> No
     assert json.loads(raw_path.read_text(encoding="utf-8"))["mode"] == "raw"
 
 
+def test_is_delta_json_parse_error_detects_jsondecodeerror() -> None:
+    module = _load_module()
+    exc = json.JSONDecodeError("bad json", "{", 1)
+    assert module._is_delta_json_parse_error(exc) is True
+
+
+def test_classify_runtime_error_marks_delta_parse() -> None:
+    module = _load_module()
+    delta_parse_error = type("DeltaParseError", (Exception,), {})
+    exc = delta_parse_error("Failed to parse delta JSON for chapter 0001")
+    assert module._classify_runtime_error(exc) == "DELTA_JSON_PARSE_FAILED"
+
+
 def test_redact_store_for_log_hides_credentials() -> None:
     module = _load_module()
     store = module.MemoryStore(

@@ -1,0 +1,14 @@
+{
+  "_comment": "角色性别配置，male=男性(他)，female=女性(她)，unknown=不确定",
+  "characters": {
+    "伊恩": "male",
+    "柯弥": "male",
+    "祝砚": "male",
+    "赫罗": "male",
+    "苏迦": "female",
+    "绛禾": "female",
+    "沙曼": "female",
+    "诺亚": "unknown",
+    "栈": "unknown"
+  }
+}

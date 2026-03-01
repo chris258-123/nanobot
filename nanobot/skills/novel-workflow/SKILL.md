@@ -31,32 +31,55 @@ When using `--embedding-model chinese-large` (`BAAI/bge-large-zh-v1.5`) or calli
 
 - `ALL_PROXY`/`all_proxy=socks://...` can break some `httpx` calls (`Unknown scheme for proxy URL`).
 - Clearing `HTTP_PROXY`/`HTTPS_PROXY` may cause slow/no-response LLM calls on networks that require HTTP proxy.
+- `chinese-large` may still try remote HuggingFace probe calls during model init if offline mode is not enabled.
 
-Use this standard fix before running workflow commands:
+Use this standard preflight before workflow commands:
 
 ```bash
 unset ALL_PROXY all_proxy
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 ```
 
 Keep `HTTP_PROXY`/`HTTPS_PROXY` if your network requires them.
-For example:
+Only clear `ALL_PROXY/all_proxy`.
+
+Example (`reprocess_all.py` + `chinese-large`):
 
 ```bash
 unset ALL_PROXY all_proxy
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 python nanobot/skills/novel-workflow/scripts/reprocess_all.py \
   --mode llm \
   --embedding-model chinese-large \
   ...
 ```
 
-For Book-B generation, use the same proxy rule:
+For Book-B generation, use the same proxy preflight:
 
 ```bash
 unset ALL_PROXY all_proxy
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 python nanobot/skills/novel-workflow/scripts/generate_book_ab.py ...
 ```
 
 Note: `generate_book_ab.py` is aligned with this rule and only strips `ALL_PROXY/all_proxy` for LLM calls.
+LiteLLM `RuntimeWarning: ... async_success_handler was never awaited` is a logging warning, not the root cause of proxy/connectivity failures.
+
+#### Local model cache check (`chinese-large`)
+
+`chinese-large` maps to `BAAI/bge-large-zh-v1.5`.
+Typical local cache path:
+
+```bash
+~/.cache/huggingface/hub/models--BAAI--bge-large-zh-v1.5
+```
+
+Quick check:
+
+```bash
+ls -1 ~/.cache/huggingface/hub/models--BAAI--bge-large-zh-v1.5
+```
 
 Important: `Qdrant 404` and `blueprint/JSON parse failure` are separate issues from proxy setup.
 - `Qdrant 404`: usually wrong collection name / route / service state.
@@ -107,6 +130,8 @@ python nanobot/skills/novel-workflow/scripts/embedder_parallel.py \
 Recommended mode (quality-first): use `--chapter-dir` (better chunk evidence chain).
 
 ```bash
+unset ALL_PROXY all_proxy
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 python nanobot/skills/novel-workflow/scripts/reprocess_all.py \
   --mode llm \
   --book-id novel_a \
@@ -156,6 +181,8 @@ Speed-first alternative (if you already have high-quality assets): replace `--ch
 Resume from breakpoint:
 
 ```bash
+unset ALL_PROXY all_proxy
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 python nanobot/skills/novel-workflow/scripts/reprocess_all.py \
   --mode llm \
   --book-id novel_a \
@@ -178,6 +205,8 @@ python nanobot/skills/novel-workflow/scripts/reprocess_all.py \
 Use `generate_book_ab.py` for A-read/B-write one-click generation + commit-memory.
 
 ```bash
+unset ALL_PROXY all_proxy
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 python nanobot/skills/novel-workflow/scripts/generate_book_ab.py \
   --target-book-id novel_b \
   --template-book-id novel_a \
@@ -224,6 +253,8 @@ python nanobot/skills/novel-workflow/scripts/generate_book_ab.py \
 Resume generation:
 
 ```bash
+unset ALL_PROXY all_proxy
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 python nanobot/skills/novel-workflow/scripts/generate_book_ab.py ... --resume
 ```
 
@@ -236,6 +267,7 @@ python nanobot/skills/novel-workflow/scripts/generate_book_ab.py ... --resume
 - `--continuity-window`: number of recent chapter capsules injected into prompt
 - `--continuity-min-entities`: minimum carried entities expected in new chapter text
 - `--continuity-min-open-threads`: minimum open-thread progress expected
+- `--continuity-min-chars`: hard minimum chapter body chars (retry if below threshold)
 - `--chapter-summary-style structured`: use structured continuity capsule instead of plain 1-2 sentence summary
 
 The script also sanitizes model output to remove duplicated heading lines inside body text
@@ -256,6 +288,49 @@ Recommended rollout:
 1) Run `0001-0010` first and verify continuity logs/injection files.  
 2) If stable, continue long-run batches (`--resume`) for full chapters.
 
+### Hierarchical blueprint mode (new default)
+
+To reduce cross-batch drift, `generate_book_ab.py` now supports hierarchical planning:
+
+- `--blueprint-mode hierarchical` (default): `master_arc -> stage_arc -> batch_blueprint`
+- `--stage-size 100`: stage granularity (recommended)
+- `--batch-size 20`: expected batch chunk metadata
+- `--freeze-published-blueprint` (default): lock already-published ranges
+- `--blueprint-root <dir>`: persist reusable blueprint artifacts
+- `--book-total-chapters 1350`: optional full-book target for long-run planning
+
+Resume example (from chapter 341):
+
+```bash
+unset ALL_PROXY all_proxy
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+python nanobot/skills/novel-workflow/scripts/generate_book_ab.py \
+  ... \
+  --start-chapter 341 \
+  --chapter-count 20 \
+  --resume \
+  --blueprint-mode hierarchical \
+  --stage-size 100 \
+  --batch-size 20 \
+  --book-total-chapters 1350 \
+  --freeze-published-blueprint
+```
+
+Batch-boundary verification (341):
+
+```bash
+python - <<'PY'
+import json
+p = "/home/chris/Desktop/my_workspace/novel_data/04/new_book/log/generate_book_ab/novel_04_b_full_1350_v2_<timestamp>/chapters/0341_pre_generation_injection.json"
+o = json.load(open(p, encoding="utf-8"))
+print("carry:", o.get("previous_chapter_carry_over"))
+print("open :", o.get("current_chapter_open_with"))
+print("capsules:", len(o.get("recent_continuity_capsules_bookB") or []))
+print("range:", (o.get("recent_continuity_capsules_bookB") or [{}])[0].get("chapter_no"), "->", (o.get("recent_continuity_capsules_bookB") or [{}])[-1].get("chapter_no"))
+print("source:", o.get("resolved_previous_carry_source"), o.get("resolved_open_with_source"))
+PY
+```
+
 ### Enforce Chinese memory fields for Book B (A-like context style)
 
 `generate_book_ab.py` now supports Chinese enforcement for Book-B memory context and commit path.
@@ -270,6 +345,7 @@ Example command (explicit):
 
 ```bash
 unset ALL_PROXY all_proxy
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 python nanobot/skills/novel-workflow/scripts/generate_book_ab.py \
   ... \
   --enforce-chinese-on-injection \
@@ -280,6 +356,8 @@ python nanobot/skills/novel-workflow/scripts/generate_book_ab.py \
 If you only want strict Chinese for `rule/status`:
 
 ```bash
+unset ALL_PROXY all_proxy
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 python nanobot/skills/novel-workflow/scripts/generate_book_ab.py \
   ... \
   --enforce-chinese-fields rule,status
@@ -295,29 +373,51 @@ When old B memory is polluted by mixed language, rebuild B before rerun:
 4) Recreate Book-B Qdrant collection.
 5) Re-run generation from chapter `0001` with `--commit-memory`.
 
-### Long-run continuation (6 -> 1200, batch size 100)
+### Full-volume batch rerun (v4 recommended script)
 
-Use the batch runner to avoid single long fragile runs:
+Current recommended full run entry is the batch shell script:
+
+- Script: `/home/chris/Desktop/my_workspace/nanobot/nanobot/skills/novel-workflow/sh/b_full_1350_v4_rebuild_from0139_batch10.sh`
+- Scope: chapters `0139-1350` (rebuild continuation on existing v4 base)
+- Batch size: `10`
+- Retry policy: per-batch max `3` attempts, `20s` backoff
+- Log: `/home/chris/Desktop/my_workspace/novel_data/04/new_book/log/b_full_1350_v4_rebuild_from0139_batch10.log`
+- tmux session: `b_full_v4_rebuild0139`
+
+Preflight checklist (before launch):
+
+1) Ensure no old full-run tmux/process is still running.
+2) Ensure template A read stores are reachable (`canon_novel_04_a_full.db`, `bolt://localhost:7689`, `novel_04_a_full_assets`).
+3) Ensure target B write stores are isolated (`canon_novel_04_b_full_1350_v4.db`, `bolt://localhost:7695`, `novel_04_b_full_1350_v4_assets`).
+
+Launch in tmux:
 
 ```bash
-unset ALL_PROXY all_proxy
-python nanobot/skills/novel-workflow/scripts/run_book_b_batches.py \
-  --start-chapter 6 \
-  --end-chapter 1200 \
-  --batch-size 100 \
-  --max-attempts 3
+tmux new-session -d -s b_full_v4_rebuild0139 \
+  "bash /home/chris/Desktop/my_workspace/nanobot/nanobot/skills/novel-workflow/sh/b_full_1350_v4_rebuild_from0139_batch10.sh"
 ```
 
-Recommended tmux launch:
+Key quality settings in this script:
+
+- Hierarchical blueprint: `--blueprint-mode hierarchical --stage-size 100 --batch-size 10 --book-total-chapters 1350 --no-freeze-published-blueprint`
+- Continuity gate: `--continuity-mode strict_gate --continuity-retry 4 --continuity-window 12`
+- Keep relaxed thread gate: `--continuity-min-open-threads 0`
+- Hard min length gate: `--continuity-min-chars 2600`
+- Chinese enforcement: `--enforce-chinese-on-injection --enforce-chinese-on-commit`
+- **LLM-only opening continuity repair** (no rule sentence injection): `--opening-rewrite-by-llm --opening-rewrite-max-attempts 3 --opening-rewrite-max-chars 900`
+
+Live monitoring:
 
 ```bash
-tmux new-session -d -s b_full_1200 \
-  "unset ALL_PROXY all_proxy; \
-   /home/chris/miniforge3/envs/nanobot/bin/python \
-   /home/chris/Desktop/my_workspace/nanobot/nanobot/skills/novel-workflow/scripts/run_book_b_batches.py \
-   --start-chapter 6 --end-chapter 1200 --batch-size 100 --max-attempts 3 \
-   | tee /home/chris/Desktop/my_workspace/novel_data/04/new_book/log/b_full_1200.launch.log"
+tmux capture-pane -pt b_full_v4_rebuild0139 -S -120
+tail -f /home/chris/Desktop/my_workspace/novel_data/04/new_book/log/b_full_1350_v4_rebuild_from0139_batch10.log
 ```
+
+Failure handling / resume:
+
+- If one batch fails 3 attempts, the script stops at that batch and keeps logs.
+- Fix root cause, then rerun the same script; it resumes by batch and existing chapter files.
+- For true clean rerun, clear v3 outputs and v3 target stores first, then relaunch.
 
 ## Isolation Rules (Critical)
 

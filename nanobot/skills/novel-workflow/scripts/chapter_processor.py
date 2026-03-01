@@ -253,6 +253,9 @@ class ChapterProcessor:
         chinese_backoff_factor: float = 2.0,
         chinese_backoff_max: float = 30.0,
         chinese_retry_jitter: float = 0.5,
+        delta_json_repair_attempts: int = 2,
+        delta_parse_debug_log: bool = True,
+        delta_parse_debug_dir: str | None = None,
     ):
         self.neo4j = Neo4jManager(neo4j_uri, neo4j_user, neo4j_pass, neo4j_database)
         self.canon_db = CanonDBV2(canon_db_path)
@@ -287,7 +290,15 @@ class ChapterProcessor:
             else None
         )
         self.delta_extractor = (
-            DeltaExtractorLLM(llm_config, max_tokens=llm_max_tokens) if llm_config else None
+            DeltaExtractorLLM(
+                llm_config,
+                max_tokens=llm_max_tokens,
+                json_repair_attempts=delta_json_repair_attempts,
+                parse_debug_log=delta_parse_debug_log,
+                parse_debug_dir=delta_parse_debug_dir,
+            )
+            if llm_config
+            else None
         )
 
         # Log embedding configuration
